@@ -1,44 +1,88 @@
 # rag-backend/main.py
 #
-# CHANGE: CORS allow_origins updated to ["*"] so that mobile clients on LAN
-# (e.g. phone at 192.168.x.x) are not blocked by origin checking.
+# CHANGES FROM PREVIOUS VERSION:
+#   P5 — Added _periodic_cloud_sync() background task (Cloud→Local Qdrant sync)
+#        Runs every 20 minutes while server has internet. Skipped gracefully
+#        when cloud store is not configured or server is offline.
 #
-# WHY: The original config only allowed http://localhost:5173 (the Vite dev
-# server). Any request from a React Native app running on a real device or
-# Expo Go had a different Origin header and was rejected with a CORS error
-# before it even reached any route handler.
-#
-# SECURITY NOTE: allow_origins=["*"] is safe here because this server runs
-# on a closed ship LAN with no external exposure. If you later expose the
-# backend publicly, lock this down to specific origins.
-#
-# NOTE: allow_credentials MUST be False when allow_origins=["*"].
-# Browsers reject credentialed requests to wildcard origins.
-#
-# CHANGE: Admin router registered under /admin prefix.
-# All write operations are available at /admin/* (protected by ADMIN_TOKEN).
-# The original /ingest, /kb, /sync routers are kept for backward compatibility.
+# ORIGINAL CHANGES (kept):
+#   - CORS allow_origins=["*"] for mobile LAN clients
+#   - Admin router under /admin prefix
+#   - Static files for /images and /pdfs
 
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib    import Path
 from fastapi    import FastAPI
 from fastapi.middleware.cors    import CORSMiddleware
 from fastapi.staticfiles        import StaticFiles
+from services.sync_service import SyncService
+from services.rag_service  import startup
+from services              import rag_service
+from routers               import chat, ingest, kb
+from routers               import sync  as sync_router
+from routers               import admin as admin_router
 
-from services.rag_service import startup
-from routers              import chat, ingest, kb
-from routers              import sync as sync_router
-from routers              import admin as admin_router
+# ── P5: Periodic Cloud→Local sync interval ────────────────────────────────────
+BACKEND_SYNC_INTERVAL_S = 20 * 60  # 20 minutes
+
+
+async def _periodic_cloud_sync():
+    """
+    Background asyncio task: syncs Cloud Qdrant → Local Qdrant every 20 minutes.
+
+    Runs only when:
+      - A cloud vector store is configured (rag_service.get_cloud_store() is not None)
+      - The server has internet access (rag_service.is_online() returns True)
+
+    Skipped silently otherwise (e.g. at-sea with local-only Qdrant).
+    The 30s initial delay lets the lifespan startup() finish before the first sync.
+    """
+    await asyncio.sleep(30)  # wait for startup to settle
+
+    while True:
+        try:
+            cloud_store = rag_service.get_cloud_store() if hasattr(rag_service, 'get_cloud_store') else None
+            is_online   = rag_service.is_online()       if hasattr(rag_service, 'is_online')       else False
+
+            if cloud_store is not None and is_online:
+                print('[PERIODIC SYNC] Running Cloud → Local vector sync')
+                loop = asyncio.get_event_loop()
+                sync = SyncService()
+                await loop.run_in_executor(None, sync.run)
+                print('[PERIODIC SYNC] Complete')
+            else:
+                print('[PERIODIC SYNC] Skipped — cloud store not configured or server offline')
+
+        except Exception as e:
+            # Never let a sync error crash the background loop
+            print(f'[PERIODIC SYNC] Error (will retry in {BACKEND_SYNC_INTERVAL_S // 60} min): {e}')
+
+        await asyncio.sleep(BACKEND_SYNC_INTERVAL_S)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Run existing startup (loads RAG service, BM25, Qdrant connection, etc.)
     await startup()
+
+    # P5: Start the periodic Cloud→Local background sync loop
+    task = asyncio.create_task(_periodic_cloud_sync())
+    print(f'[STARTUP] Cloud sync task scheduled every {BACKEND_SYNC_INTERVAL_S // 60} min')
+
     yield
+
+    # Clean shutdown — cancel the background task so it doesn't linger
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    print('[SHUTDOWN] Periodic sync task stopped')
 
 
 app = FastAPI(
