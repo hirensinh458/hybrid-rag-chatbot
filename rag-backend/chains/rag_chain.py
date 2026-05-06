@@ -323,6 +323,27 @@ class RAGChain:
             is_offline   = is_offline,
             store        = active_store,
         )
+
+        # ── Log raw retrieval chunks (before rerank) for online/offline comparison ──
+        mode_tag = "OFFLINE" if is_offline else "ONLINE"
+        raw_chunks = retrieval.get_chunks()
+        logger.info(
+            "[RAG CHAIN] Raw retrieval (before rerank): %d chunks | mode=%s",
+            len(raw_chunks), mode_tag,
+        )
+        for i, c in enumerate(raw_chunks):
+            logger.info(
+                "[RAG CHAIN] RAW[%d] src=%s p=%s score=%.4f parent_id=%s content_preview=%r",
+                i,
+                c.get("source", "?"),
+                c.get("page", "?"),
+                c.get("score", 0.0),
+                c.get("parent_id", "")[:12] if c.get("parent_id") else "(none)",
+                c.get("content", "")[:60].replace("\n", " "),
+            )
+        # ────────────────────────────────────────────────────────────────────────── 
+
+
         elapsed_retrieve = (time.perf_counter() - t_retrieve) * 1000
         logger.info(
             "[RAG CHAIN] Retrieval: %d chunks in %.0f ms (store=%s)",

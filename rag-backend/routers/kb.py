@@ -2,27 +2,26 @@
 #
 # CHANGES vs previous version:
 #
-#   FIX — /kb/export returned embedding: null for every chunk (0 vectors on mobile)
+#   FIX — /kb/export now includes `parent_id` in every chunk payload.
+#
+#     ROOT CAUSE:
+#       ChainResponse.get_citations() (online mode) deduplicates citations on
+#       chunk["parent_id"].  HybridRetriever._expand_to_parents() also deduplicates
+#       on parent_id.  But /kb/export was building its response from bm25._chunks
+#       without ever copying the parent_id field — so every chunk exported to the
+#       mobile app had no parent_id, making offline deduplication impossible.
+#
 #     FIX:
-#       Import _content_hash from qdrant_store. Both the export endpoint and
-#       get_vectors_for_export() now use the same hash of (source, page, content[:80]).
+#       Add  "parent_id": c.get("parent_id", "")  to the chunk dict built inside
+#       the for-loop in export_chunks().  The BM25 store retains the field exactly
+#       as the HierarchicalChunker set it (format: "par_<md5[:12]>").
 #
-#   FIX — "Sync failed: HTTP 304" in mobile app
-#     FIX:
-#       /kb/export now fetched with raw fetch() in the mobile app (see
-#       useOfflineSearch.js change). No change needed in kb.py for this —
-#       the server-side 304 response is already correct.
+#     DOWNSTREAM EFFECT:
+#       db.js stores parent_id in SQLite.
+#       useChat.js (deep_offline path) deduplicates on parent_id before
+#       displaying OfflineChunkCards — matching the online-mode behaviour.
 #
-#   KEPT: FORCE_OFFLINE_MODE override on /health (from previous version)
-#   KEPT: All other endpoints unchanged
-#
-# LOGGING CHANGES:
-#   - /health logs current online/offline state and groq availability at INFO.
-#   - /kb/export logs etag comparison (304 hit / miss), export size in chunks
-#     and vectors matched, and total serialisation time.
-#   - /stats and /documents log KB sizes at DEBUG.
-#   - /collection wipe is logged at WARNING (destructive action).
-#   - All errors are logged at ERROR with exc_info.
+# All other endpoints and logic are UNCHANGED.
 
 import os
 import time
@@ -40,8 +39,7 @@ from config          import settings
 from datetime        import datetime, timezone
 from utils.logger    import get_logger
 
-# FIX: import the shared content-hash helper so chunk_id keys in this endpoint
-# are IDENTICAL to the keys produced by get_vectors_for_export() in Qdrant.
+# Shared content-hash helper — must match get_vectors_for_export() in Qdrant
 from vectorstore.qdrant_store import _content_hash
 
 logger = get_logger(__name__)
@@ -63,7 +61,6 @@ async def health():
     ts = datetime.now(timezone.utc).isoformat()
 
     if force_offline:
-        # FORCE_OFFLINE_MODE is set — log once so operators know why clients see offline
         logger.warning(
             "[KB/HEALTH] FORCE_OFFLINE_MODE=true — reporting is_online=false "
             "(dev override active)"
@@ -115,13 +112,18 @@ async def export_chunks(
 
     Response body:
       {
-        "chunks": [ { "id", "source", "content", "parent_content", "page",
-                      "chunk_type", "section_path", "heading",
+        "chunks": [ { "id", "source", "content", "parent_content", "parent_id",
+                      "page", "chunk_type", "section_path", "heading",
                       "bbox", "page_width", "page_height",
                       "embedding": [float x 384] | null }, ... ],
         "total":  <int>,
         "etag":   "<md5>"
       }
+
+    parent_id: stable hash set by HierarchicalChunker (format "par_<md5[:12]>").
+      Multiple child chunks sharing the same parent_id belong to the same
+      parent passage.  The mobile app uses this for deduplication — matching
+      the behaviour of ChainResponse.get_citations() in online mode.
     """
     logger.info(
         "[KB/EXPORT] /kb/export requested — include_vectors=%s",
@@ -140,12 +142,11 @@ async def export_chunks(
         vs.count(),
     )
 
-    # ── Etag delta check ──────────────────────────────────────────────────────
+    # ── Etag delta check ─────────────────────────────────────────────────────
     etag        = await run_in_threadpool(vs.get_export_etag)
     client_etag = request.headers.get("If-None-Match", "")
 
     if client_etag and client_etag == etag:
-        # Nothing changed — tell the app to skip the DB write
         logger.info(
             "[KB/EXPORT] 304 Not Modified — client etag matches (etag=%s...)",
             etag[:12],
@@ -161,7 +162,7 @@ async def export_chunks(
         etag[:12],
     )
 
-    # ── Fetch vectors from Qdrant ─────────────────────────────────────────────
+    # ── Fetch vectors from Qdrant ────────────────────────────────────────────
     # id_to_vec is keyed by _content_hash(source, page, content) —
     # the same hash we build below for each BM25 chunk.
     id_to_vec: dict = {}
@@ -175,7 +176,7 @@ async def export_chunks(
             len(id_to_vec), elapsed_vecs,
         )
 
-    # ── Build response payload ────────────────────────────────────────────────
+    # ── Build response payload ───────────────────────────────────────────────
     chunks          = []
     matched_vectors = 0
 
@@ -191,8 +192,9 @@ async def export_chunks(
             _bm25_sample_logged = True
             logger.debug(
                 "[KB/EXPORT] First BM25 chunk sample — "
-                "source=%r  page=%r  content_first80=%r",
+                "source=%r  page=%r  content_first80=%r  parent_id=%r",
                 source, page, content[:80],
+                c.get("parent_id", ""),
             )
             sample_keys = list(id_to_vec.keys())[:5]
             logger.debug(
@@ -210,6 +212,10 @@ async def export_chunks(
             "source":         source,
             "content":        content,
             "parent_content": c.get("parent_content") or content,
+            # FIX: parent_id now exported so the mobile app can deduplicate
+            # offline results on parent_id — mirroring ChainResponse.get_citations()
+            # which is the reference implementation for online-mode deduplication.
+            "parent_id":      c.get("parent_id", ""),
             "page":           page,
             "chunk_type":     c.get("type", "text"),
             "section_path":   c.get("section_path", ""),
@@ -321,6 +327,7 @@ async def debug_hash():
             "source":       repr(src),
             "page":         repr(pg),
             "content_80":   repr(ct[:80]),
+            "parent_id":    c.get("parent_id", ""),
             "hash":         key,
             "in_qdrant":    key in qdrant_map,
         })

@@ -289,7 +289,6 @@ async def chat_stream(req: ChatRequest):
                                 "heading"     : c.get("heading", ""),
                                 "section_path": c.get("section_path", ""),
                                 "chunk_type"  : c.get("type", "text"),
-                                # bbox + source_url for clickable citations
                                 "bbox"        : c.get("bbox"),
                                 "page_width"  : c.get("page_width"),
                                 "page_height" : c.get("page_height"),
@@ -301,6 +300,42 @@ async def chat_stream(req: ChatRequest):
                             f"/images/{Path(p).name}"
                             for p in chunk.get_images()
                         ]
+
+                    # ── ONLINE RETRIEVAL CHUNKS LOG (INFO level for comparison) ──
+                    retrieval_chunks = chunk.retrieval.get_chunks()
+                    logger.info(
+                        "[CHAT/ONLINE] Final retrieval chunks passed to LLM: %d chunks",
+                        len(retrieval_chunks)
+                    )
+
+                    # ── SEMANTIC SEARCH ONLY LOG ──────────────────
+                    # Access raw retrieval before rerank from chain
+                    import services.rag_service as _rs
+                    chain2 = _rs.get_chain()
+                    q_vec = chain2.retriever.embedder.embed_text(req.question)
+                    logger.info(
+                        "[CHAT/ONLINE/SEMANTIC] Query embedding first 10: %s",
+                        q_vec[:10]
+                    )
+                    logger.info(
+                        "[CHAT/ONLINE/SEMANTIC] Query embedding norm: %.4f",
+                        sum(v*v for v in q_vec) ** 0.5
+                    )
+                    # Log the raw dense results from rag_chain._retrieve
+                    # These are already logged at INFO as [RAG CHAIN] RAW[...]
+                    # ──────────────────────────────────────────────────
+
+                    for i, rc in enumerate(retrieval_chunks):
+                        logger.info(
+                            "[CHAT/ONLINE] chunk[%d] src=%s p=%s score=%.4f parent_id=%s content_preview=%r",
+                            i,
+                            rc.get("source", "?"),
+                            rc.get("page", "?"),
+                            rc.get("rerank_score", rc.get("score", 0.0)),
+                            rc.get("parent_id", "")[:12],
+                            rc.get("content", "")[:80].replace("\n", " "),
+                        )
+                    # ────────────────────────────────────────────────────────────
 
                     elapsed = (time.perf_counter() - t_start) * 1000
                     logger.info(
