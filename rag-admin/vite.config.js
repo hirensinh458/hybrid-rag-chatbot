@@ -16,6 +16,15 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
+      '/api': {                          // keep if other /api/* routes exist
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        secure: false,
+      },
+      '/sync': {                         // ← add this
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
     },
   },
 })

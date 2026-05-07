@@ -1,36 +1,30 @@
 // src/components/MessageBubble.jsx
 //
-// CHANGES vs original:
-//   - OfflineChunkCards component added — renders offline_chunks as manual excerpt cards
-//     showing source filename, page number, section heading, and raw chunk text.
-//   - When message.is_offline is true, renders OfflineChunkCards instead of markdown.
-//   - Online path unchanged.
+// CHANGE — Online citations are now clickable PDF buttons (same as offline mode):
 //
-// NEW (B3/B4/B5/B1/B2):
-//   - B3: Restructured chunk card layout — breadcrumb section path, relevance bar
-//   - B4: Query keyword highlighting in chunk content
-//   - B5: Expand/collapse chunk content (3 lines default, "Show more" toggle)
-//   - B1/B2: Clickable "Open in manual" button opens PdfViewerModal (uses bbox when available)
+//   BEFORE:
+//     Citations rendered as plain <span> chips — decorative only, not interactive.
+//     Clicking a source like "engine.pdf · p12" did nothing.
 //
-// ── BUG 2 FIX (frontend) — Citations field name mismatch ───────────────────
-//   PROBLEM:
-//     The Citations component checked `c.chunk_type` to pick the icon (🖼/⊞/◈)
-//     but the backend sends the field as `c.type` — so chunk_type was always
-//     undefined and every citation showed the default ◈ icon regardless of
-//     whether the source was a table or image.
+//   AFTER:
+//     Each citation chip is a <button> that opens PdfViewerModal at the correct
+//     page, with the section path shown in the modal header — identical behaviour
+//     to the offline OfflineChunkCard "Open" button.
 //
-//   FIX:
-//     Use `c.type` (matching the backend's field name) for icon selection.
-//     The `|| c.chunk_type` fallback keeps backward compatibility in case
-//     any older cached response still has the old field name.
+//   HOW:
+//     1. Citations component receives an onOpenCitation(citation) callback.
+//     2. Clicking a chip calls onOpenCitation with the citation object.
+//     3. MessageBubble manages pdfModal state (same pattern as OfflineChunkCards).
+//     4. PdfViewerModal is opened with { filename, page, bbox, sectionPath }.
 //
-// ── BUG 3 (frontend side, automatic) ────────────────────────────────────────
-//   No code change needed here.  Bug 3 was fixed in rag_chain.py (backend):
-//   OfflineChunk.content is now the full parent_content (1500 chars) instead
-//   of the 300-char child fragment.  The existing OfflineChunkCard already
-//   handles long content correctly via the isLong / expand toggle — the cards
-//   will automatically show readable passages once the backend fix is deployed.
-// ─────────────────────────────────────────────────────────────────────────────
+//   NOTE ON bbox:
+//     Online citations currently carry { source, page, heading, section_path, type }.
+//     bbox is NOT included in the citation object sent by the backend (it is only
+//     stored per-chunk, not per-citation). The modal opens at the correct page
+//     but without a highlight box — exactly the same as offline chunks that have
+//     no bbox. No backend change is needed; bbox simply defaults to null.
+//
+// All other code (OfflineChunkCard, RetrievedImages, etc.) is UNCHANGED.
 
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
@@ -50,13 +44,15 @@ function Cursor() {
   )
 }
 
-function Citations({ citations }) {
+// ── CHANGED: Citations now receives onOpenCitation callback ──────────────────
+// Each chip is a clickable button that fires onOpenCitation(citation).
+// Hover state shows the cursor change and a subtle border highlight so users
+// know the chip is interactive, matching the offline "Open" button affordance.
+
+function Citations({ citations, onOpenCitation }) {
   if (!citations?.length) return null
 
-  // Deduplicate on (source, page) as a frontend safety net.
-  // The backend already deduplicates by parent_id (Bug 2 fix), so this
-  // mostly handles the edge case of general / fallback responses where
-  // parent_id is absent and two chunks share the same source+page.
+  // Deduplicate on (source, page) — same logic as before, unchanged.
   const unique = citations.filter(
     (c, i, a) => a.findIndex(x => x.source === c.source && x.page === c.page) === i
   )
@@ -64,28 +60,70 @@ function Citations({ citations }) {
   return (
     <div style={{ marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 5 }}>
       {unique.map((c, i) => {
-        // BUG 2 FIX: backend sends `type`, not `chunk_type`.
-        // Use `c.type` with a fallback to `c.chunk_type` for backward compat.
+        // BUG 2 FIX (unchanged): backend sends `type`, not `chunk_type`.
         const chunkType = c.type || c.chunk_type || 'text'
         const icon      = chunkType === 'image' ? '🖼' : chunkType === 'table' ? '⊞' : '◈'
         const section   = c.section_path || c.heading || ''
+        const hasPdf    = !!c.source
+
         return (
-          <span key={i} style={{
-            display: 'inline-flex', alignItems: 'center', gap: 5,
-            background: 'var(--teal-dim)',
-            border: '1px solid rgba(45,212,191,.18)',
-            borderRadius: 20, padding: '3px 10px',
-            fontSize: '.69rem', color: 'var(--teal)',
-            fontFamily: 'var(--font-mono)', cursor: 'default',
-          }} title={section || undefined}>
+          // CHANGED: was <span cursor:'default'>, now <button> that opens PDF viewer
+          <button
+            key={i}
+            onClick={() => hasPdf && onOpenCitation(c)}
+            disabled={!hasPdf}
+            title={
+              hasPdf
+                ? `Open ${c.source}${c.page ? ` at page ${c.page}` : ''} in PDF viewer`
+                : section || undefined
+            }
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 5,
+              background: 'var(--teal-dim)',
+              border: '1px solid rgba(45,212,191,.18)',
+              borderRadius: 20, padding: '3px 10px',
+              fontSize: '.69rem', color: 'var(--teal)',
+              fontFamily: 'var(--font-mono)',
+              // Interactive styles
+              cursor: hasPdf ? 'pointer' : 'default',
+              transition: 'border-color .15s, background .15s',
+              // Reset browser button defaults
+              outline: 'none',
+              textDecoration: 'none',
+            }}
+            onMouseEnter={e => {
+              if (hasPdf) {
+                e.currentTarget.style.borderColor  = 'rgba(45,212,191,.55)'
+                e.currentTarget.style.background   = 'rgba(45,212,191,.18)'
+              }
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.borderColor = 'rgba(45,212,191,.18)'
+              e.currentTarget.style.background  = 'var(--teal-dim)'
+            }}
+          >
             <span style={{ fontSize: 10 }}>{icon}</span>
+
+            {/* Source filename + page number — same text as before */}
             {c.source}{c.page ? ` · p${c.page}` : ''}
+
+            {/* Section label — unchanged */}
             {section && (
               <span style={{ color: 'rgba(45,212,191,.5)', fontSize: '.65rem' }}>
                 {section.length > 22 ? section.slice(0, 22) + '…' : section}
               </span>
             )}
-          </span>
+
+            {/* NEW: small "open" arrow so users know it's clickable */}
+            {hasPdf && (
+              <span style={{
+                fontSize: '.6rem', color: 'rgba(45,212,191,.6)',
+                marginLeft: 1,
+              }}>
+                ↗
+              </span>
+            )}
+          </button>
         )
       })}
     </div>
@@ -140,7 +178,7 @@ function TypingDots() {
   )
 }
 
-// ── B4: Highlight query keywords in text ──────────────────────
+// ── B4: Highlight query keywords in text (UNCHANGED) ─────────────────────────
 const STOPWORDS = new Set(['a','an','the','is','are','was','were','be','been','being',
   'have','has','had','do','does','did','will','would','could','should','may','might',
   'shall','can','need','dare','used','ought','in','on','at','to','for','of','and',
@@ -161,7 +199,7 @@ function highlightKeywords(text, query) {
   )
 }
 
-// ── B3: Section breadcrumb ──────────────────────────────────────
+// ── B3: Section breadcrumb (UNCHANGED) ───────────────────────────────────────
 function SectionBreadcrumb({ section }) {
   if (!section) return null
   const parts = section.split(/\s*[>\/]\s*/)
@@ -181,9 +219,8 @@ function SectionBreadcrumb({ section }) {
   )
 }
 
-// ── B3: Relevance bar ───────────────────────────────────────────
+// ── B3: Relevance bar (UNCHANGED) ────────────────────────────────────────────
 function RelevanceBar({ score }) {
-  // score is typically 0–1 from RRF; clamp to 0–1
   const pct = Math.min(1, Math.max(0, score)) * 100
   const color = pct > 65 ? '#34d399' : pct > 35 ? '#fbbf24' : '#94a3b8'
   return (
@@ -201,11 +238,7 @@ function RelevanceBar({ score }) {
   )
 }
 
-// ── Offline chunk card (B2 + B3 + B4 + B5) ────────────────────
-//
-// After Bug 3 is fixed in the backend, chunk.content here is the full
-// parent_content (up to 1500 chars) instead of a 300-char fragment.
-// isLong will correctly fire for most cards, giving users the expand toggle.
+// ── Offline chunk card (B2 + B3 + B4 + B5) — UNCHANGED ──────────────────────
 function OfflineChunkCard({ chunk, index, query, onOpenPdf }) {
   const [expanded, setExpanded] = useState(false)
   const section  = chunk.section_path || chunk.heading || ''
@@ -313,9 +346,9 @@ function OfflineChunkCard({ chunk, index, query, onOpenPdf }) {
   )
 }
 
-// Renders all offline chunks with a header
+// Renders all offline chunks with a header (UNCHANGED)
 function OfflineChunkCards({ chunks, query }) {
-  const [pdfModal, setPdfModal] = useState(null) // { filename, page, bbox, sectionPath }
+  const [pdfModal, setPdfModal] = useState(null)
 
   if (!chunks?.length) {
     return (
@@ -368,10 +401,26 @@ function OfflineChunkCards({ chunks, query }) {
 }
 
 
-// ── Main export ───────────────────────────────────────────────
+// ── Main export ───────────────────────────────────────────────────────────────
 
 export default function MessageBubble({ message, query }) {
   const isUser = message.role === 'user'
+
+  // NEW: pdfModal state for online mode citation clicks
+  // Sits here (not inside Citations) so PdfViewerModal is rendered outside
+  // the flex chip row, avoiding layout issues from a modal inside inline-flex.
+  const [onlinePdfModal, setOnlinePdfModal] = useState(null)
+
+  // Handler passed down to Citations — converts a citation object into modal props
+  const handleOpenCitation = (citation) => {
+    setOnlinePdfModal({
+      filename   : citation.source,
+      page       : citation.page || 1,
+      // bbox is not in citation objects — opens at correct page without highlight
+      bbox       : citation.bbox || null,
+      sectionPath: citation.section_path || citation.heading || '',
+    })
+  }
 
   if (isUser) {
     return (
@@ -447,12 +496,12 @@ export default function MessageBubble({ message, query }) {
           )}
         </div>
 
-        {/* ── OFFLINE: chunk cards ─────────────────────── */}
+        {/* ── OFFLINE: chunk cards (UNCHANGED) ─────────── */}
         {message.is_offline && (
           <OfflineChunkCards chunks={message.offline_chunks} query={query} />
         )}
 
-        {/* ── ONLINE: markdown LLM answer ─────────────── */}
+        {/* ── ONLINE: markdown + CHANGED citations ──────── */}
         {!message.is_offline && (
           <>
             {message.content ? (
@@ -469,7 +518,13 @@ export default function MessageBubble({ message, query }) {
             {!message.streaming && (
               <>
                 <RetrievedImages imageUrls={message.image_urls} />
-                <Citations citations={message.citations} />
+
+                {/* CHANGED: pass onOpenCitation so chips open the PDF viewer */}
+                <Citations
+                  citations={message.citations}
+                  onOpenCitation={handleOpenCitation}
+                />
+
                 {tokens && (
                   <div style={{
                     marginTop: 8, fontSize: '.64rem', fontFamily: 'var(--font-mono)',
@@ -483,6 +538,17 @@ export default function MessageBubble({ message, query }) {
           </>
         )}
       </div>
+
+      {/* NEW: PDF viewer modal for online citation clicks — rendered outside the bubble */}
+      {onlinePdfModal && (
+        <PdfViewerModal
+          filename={onlinePdfModal.filename}
+          page={onlinePdfModal.page}
+          bbox={onlinePdfModal.bbox}
+          sectionPath={onlinePdfModal.sectionPath}
+          onClose={() => setOnlinePdfModal(null)}
+        />
+      )}
     </div>
   )
 }

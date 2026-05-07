@@ -13,35 +13,25 @@
 #       retriever.expand_to_parents()    → parent blobs (1500 tok) for LLM
 #
 # ── BUG 2 FIX — Online mode citations are inaccurate ─────────────────────
-#   PROBLEM:
-#     get_citations() returned one citation for every chunk in the retrieval
-#     result, even when 5 expanded chunks all came from the same parent
-#     passage.  The LLM may only have used 2 of the 5 contexts but all 5
-#     showed up as sources.  Additionally, because expand_to_parents() swaps
-#     content for parent_content but leaves all other metadata as the child's,
-#     the page reported in the citation was the child's page, not necessarily
-#     the page that contained the answer.
-#
-#   FIX (short-term, effective immediately):
-#     Deduplicate citations on parent_id — same parent passage → one citation.
-#     This eliminates the multiple-child-same-parent duplication and reduces
-#     noise significantly.  The page shown is still the child's page (the
-#     start of the parent passage) which is correct for the majority of cases.
+#   Deduplicate citations on parent_id to eliminate multiple children from
+#   the same parent appearing as separate citation cards.
 #
 # ── BUG 3 FIX — Offline mode shows unreadable 300-char child fragments ───
-#   PROBLEM:
-#     The offline branch of stream() built OfflineChunk objects using
-#     c.get("content", "") which is the 300-character child fragment.
-#     c["parent_content"] — the full 1500-char readable passage — was ignored.
+#   Use parent_content instead of raw child content in offline OfflineChunks.
 #
-#   FIX:
-#     Use  c.get("parent_content") or c.get("content", "")
-#     The `or` fallback handles atomic chunks (tables, images) where
-#     parent_content == content, so there is no regression for those types.
+# LOGGING CHANGES:
+#   - get_logger(__name__) replaces all print() calls.
+#   - question text is logged at DEBUG (not INFO) to avoid leaking user PII
+#     to INFO-level log aggregators.  Override with LOG_LEVEL=DEBUG locally.
+#   - All timing-sensitive paths (retrieval, rerank, LLM stream) log elapsed
+#     milliseconds so performance regressions are immediately visible.
+#   - Fallback triggers (empty context, low score) are logged at WARNING so
+#     they stand out — they indicate retrieval degradation.
 # ──────────────────────────────────────────────────────────────────────────
 
 import os
 import sys
+import time
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from retrieval.naive_retriever  import NaiveRetriever, RetrievalResult
@@ -52,6 +42,9 @@ from vectorstore.qdrant_store   import QdrantVectorStore, BaseVectorStore
 from embeddings.embedder        import EmbedderFactory
 from schemas                    import OfflineQueryResponse, OfflineChunk
 from config                     import TOP_K, MIN_RERANK_SCORE, settings
+from utils.logger               import get_logger
+
+logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────────────────
@@ -150,6 +143,11 @@ class ChainResponse:
                 "type"        : chunk.get("type",          "text"),
             })
 
+        logger.debug(
+            "get_citations: %d unique citations from %d chunks",
+            len(citations),
+            len(self.retrieval.get_chunks()),
+        )
         return citations
 
     def get_images(self) -> list[str]:
@@ -206,13 +204,19 @@ class RAGChain:
         cite_sources  : bool            = True,
         llm_provider  : str             = "groq",
     ):
+        logger.info("[RAG CHAIN] Initialising RAGChain...")
+
         # ── LLM ───────────────────────────────────────────
         self.llm = llm or LLMFactory.get(llm_provider)
         self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
+        logger.info("[RAG CHAIN] LLM: %s", self.llm.model_name)
 
         # ── Vector store ──────────────────────────────────
         embedder   = EmbedderFactory.get("huggingface")
         self.store = vector_store or QdrantVectorStore(embedder=embedder)
+        logger.info(
+            "[RAG CHAIN] Vector store: %s", type(self.store).__name__
+        )
 
         # ── Retriever ─────────────────────────────────────
         if retriever is not None:
@@ -223,11 +227,24 @@ class RAGChain:
                 embedder     = embedder,
                 top_k        = retrieve_top_k,
             )
+        logger.info(
+            "[RAG CHAIN] Retriever: %s  top_k=%d",
+            type(self.retriever).__name__,
+            retrieve_top_k,
+        )
 
         # ── Reranker ──────────────────────────────────────
         self.use_reranker = use_reranker
         self.reranker     = reranker or (Reranker() if use_reranker else None)
         self.rerank_top_k = rerank_top_k
+        self.parent_rerank_top_k = settings.parent_rerank_top_k
+        logger.info(
+            "[RAG CHAIN] Reranker: %s  (children first — A4 flow)  "
+            "rerank_top_k=%d → parent_rerank_top_k=%d",
+            "enabled" if use_reranker else "disabled",
+            rerank_top_k,
+            self.parent_rerank_top_k,
+        )
 
         # ── Settings ──────────────────────────────────────
         self.retrieve_top_k  = retrieve_top_k
@@ -237,74 +254,165 @@ class RAGChain:
         # ── Memory ────────────────────────────────────────
         self.history = self.llm.history
 
-        print(f"\n  [RAG CHAIN] ✅ Ready!")
-        print(f"  [RAG CHAIN] LLM       : {self.llm.model_name}")
-        print(f"  [RAG CHAIN] Retriever : {type(self.retriever).__name__}")
-        print(f"  [RAG CHAIN] Reranker  : {'✅ children first (A4)' if use_reranker else '❌'}")
-        print(f"  [RAG CHAIN] Mode      : online/offline branching enabled")
+        logger.info("[RAG CHAIN] ✅ Ready! Online/offline branching enabled.")
 
     # ── INDEXING ──────────────────────────────────────────
 
     def index_documents(self, chunks: list[dict]) -> None:
+        """Index document chunks into the vector store and retriever."""
+        logger.info("[RAG CHAIN] Indexing %d chunks into vector store...", len(chunks))
+        t0 = time.perf_counter()
         self.store.add_documents(chunks)
         if hasattr(self.retriever, "index_chunks"):
             self.retriever.index_chunks(chunks)
-        print(f"  [RAG CHAIN] Indexed {len(chunks)} chunks.")
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[RAG CHAIN] ✅ Indexed %d chunks in %.0f ms",
+            len(chunks), elapsed,
+        )
 
     # ── RETRIEVAL ─────────────────────────────────────────
 
     def _retrieve(self, question: str, is_offline: bool = False) -> RetrievalResult:
         """
         Run retrieval with the correct child-first / parent-expand order.
- 
+
         OFFLINE mode:
             retrieve() → child chunks (300 tok) → return directly
             No reranking (CPU-intensive), no parent expansion.
- 
+
         ONLINE mode (A4 fix):
             retrieve() → child chunks (300 tok)
             [optional] rerank children → precise cross-encoder signal
             expand_to_parents()        → 1500-tok passages for LLM context
- 
+
         PHASE 4 CHANGE:
             store=rag_service.get_vector_store() passed to retriever.retrieve()
             so online calls use the cloud store and offline calls use local,
             without rebuilding the chain on network state changes.
         """
+        mode_label = "OFFLINE" if is_offline else "ONLINE"
+        logger.debug(
+            "[RAG CHAIN] _retrieve() — mode=%s  filter=%s  question_len=%d chars",
+            mode_label,
+            self._source_filter or "none",
+            len(question),
+        )
+
         # ── Phase 4: resolve active store on every call ────────────────────
         # Imported inside the method to avoid circular import
         # (rag_service imports RAGChain at module level).
         import services.rag_service as _rag_svc
         active_store = _rag_svc.get_vector_store()
- 
+        store_tag = (
+            "cloud"
+            if (active_store and active_store is not self.store)
+            else "local"
+        )
+        logger.debug(
+            "[RAG CHAIN] Active vector store for this query: %s (%s)",
+            type(active_store).__name__,
+            store_tag,
+        )
+
+        t_retrieve = time.perf_counter()
         retrieval = self.retriever.retrieve(
             question,
             filter_field = "source" if self._source_filter else None,
             filter_value = self._source_filter,
             is_offline   = is_offline,
-            store        = active_store,              # ← the only new argument
+            store        = active_store,
         )
- 
+
+        # ── Log raw retrieval chunks (before rerank) for online/offline comparison ──
+        mode_tag = "OFFLINE" if is_offline else "ONLINE"
+        raw_chunks = retrieval.get_chunks()
+        logger.info(
+            "[RAG CHAIN] Raw retrieval (before rerank): %d chunks | mode=%s",
+            len(raw_chunks), mode_tag,
+        )
+        for i, c in enumerate(raw_chunks):
+            logger.info(
+                "[RAG CHAIN] RAW[%d] src=%s p=%s score=%.4f parent_id=%s content_preview=%r",
+                i,
+                c.get("source", "?"),
+                c.get("page", "?"),
+                c.get("score", 0.0),
+                c.get("parent_id", "")[:12] if c.get("parent_id") else "(none)",
+                c.get("content", "")[:60].replace("\n", " "),
+            )
+        # ────────────────────────────────────────────────────────────────────────── 
+
+
+        elapsed_retrieve = (time.perf_counter() - t_retrieve) * 1000
+        logger.info(
+            "[RAG CHAIN] Retrieval: %d chunks in %.0f ms (store=%s)",
+            len(retrieval), elapsed_retrieve, store_tag,
+        )
+
         # ── OFFLINE: return child chunks directly ──────────────────────────
         if is_offline:
-            print(f"  [RAG CHAIN] Offline — returning {len(retrieval)} child chunks")
+            logger.info(
+                "[RAG CHAIN] Offline mode — returning %d child chunks "
+                "(no rerank, no parent expansion)",
+                len(retrieval),
+            )
             return retrieval
- 
-        # ── ONLINE: rerank children first (A4) ────────────────────────────
+
+        # ── ONLINE RERANK #1: rerank children (precise, 300-tok fragments) ─
         if self.use_reranker and self.reranker and len(retrieval) > 0:
-            print(f"  [RAG CHAIN] Reranking {len(retrieval)} children...")
+            logger.info(
+                "[RAG CHAIN] Rerank #1 — scoring %d children (300-tok fragments)...",
+                len(retrieval),
+            )
+            t_rerank1 = time.perf_counter()
             retrieval = self.reranker.rerank(
                 query     = question,
                 retrieval = retrieval,
-                top_k     = self.rerank_top_k,
+                top_k     = self.rerank_top_k,        # e.g. 20 → 10
             )
- 
-        # ── Expand top-N children to parent passages ───────────────────────
+            elapsed_rerank1 = (time.perf_counter() - t_rerank1) * 1000
+            logger.info(
+                "[RAG CHAIN] Rerank #1 done — kept %d children  (%.0f ms)",
+                len(retrieval), elapsed_rerank1,
+            )
+
+        # ── Expand top-N reranked children to parent passages ─────────────
         if hasattr(self.retriever, "expand_to_parents"):
+            t_expand = time.perf_counter()
+            pre_expand = len(retrieval)
             retrieval = self.retriever.expand_to_parents(retrieval)
+            elapsed_expand = (time.perf_counter() - t_expand) * 1000
+            logger.info(
+                "[RAG CHAIN] Parent expansion: %d → %d passages  (%.0f ms)",
+                pre_expand, len(retrieval), elapsed_expand,
+            )
         else:
-            print("  [RAG CHAIN] expand_to_parents not available — skipping")
- 
+            logger.warning(
+                "[RAG CHAIN] expand_to_parents not available on %s — skipping",
+                type(self.retriever).__name__,
+            )
+
+        # ── ONLINE RERANK #2: rerank parents (full context, 1500-tok) ─────
+        # Cross-encoder now scores the FULL parent passage against the query,
+        # not the small child fragment. This is the definitive relevance signal.
+        if self.use_reranker and self.reranker and len(retrieval) > 0:
+            logger.info(
+                "[RAG CHAIN] Rerank #2 — scoring %d parent passages (1500-tok)...",
+                len(retrieval),
+            )
+            t_rerank2 = time.perf_counter()
+            retrieval = self.reranker.rerank(
+                query     = question,
+                retrieval = retrieval,
+                top_k     = self.parent_rerank_top_k, # e.g. 10 → 5
+            )
+            elapsed_rerank2 = (time.perf_counter() - t_rerank2) * 1000
+            logger.info(
+                "[RAG CHAIN] Rerank #2 done — kept %d parent passages for LLM  (%.0f ms)",
+                len(retrieval), elapsed_rerank2,
+            )
+
         return retrieval
 
     # ── PROMPT BUILDING ───────────────────────────────────
@@ -319,7 +427,14 @@ class RAGChain:
         Blocking online RAG pipeline.
         Always assumes online — use stream() for online/offline branching.
         """
+        logger.info("[RAG CHAIN] ask() — has_kb=%s", has_kb)
+        t0 = time.perf_counter()
+
+        # No KB available — use general fallback prompt
         if not has_kb:
+            logger.warning(
+                "[RAG CHAIN] No KB documents — falling back to general LLM response"
+            )
             self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
             result = self.llm.generate(
                 prompt   = question,
@@ -327,6 +442,15 @@ class RAGChain:
                 store_as = question,
             )
             self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "[RAG CHAIN] General fallback response generated in %.0f ms "
+                "(tokens: prompt=%d  completion=%d  total=%d)",
+                elapsed,
+                result.get("usage", {}).get("prompt_tokens",     0),
+                result.get("usage", {}).get("completion_tokens", 0),
+                result.get("usage", {}).get("total_tokens",      0),
+            )
             return ChainResponse(
                 answer     = result["content"],
                 retrieval  = RetrievalResult([]),
@@ -336,13 +460,25 @@ class RAGChain:
                 query_type = "general",
             )
 
+        # ── Retrieve + optional rerank ────────────────────
         retrieval = self._retrieve(question, is_offline=False)
         context   = retrieval.to_context_string()
+        best_score = retrieval.best_score() if len(retrieval) > 0 else 0.0
+        logger.debug(
+            "[RAG CHAIN] Context length: %d chars  best_rerank_score=%.4f",
+            len(context), best_score,
+        )
 
+        # ── Weak context / low score fallback ────────────
         if not context.strip() or (
             self.use_reranker
-            and retrieval.best_score() < MIN_RERANK_SCORE
+            and best_score < MIN_RERANK_SCORE
         ):
+            logger.warning(
+                "[RAG CHAIN] ⚠ Weak/empty context (best_score=%.4f < threshold=%.4f) — "
+                "falling back to general LLM response",
+                best_score, MIN_RERANK_SCORE,
+            )
             self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
             result = self.llm.generate(
                 prompt   = question,
@@ -350,6 +486,11 @@ class RAGChain:
                 store_as = question,
             )
             self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "[RAG CHAIN] Fallback response generated in %.0f ms (no KB context used)",
+                elapsed,
+            )
             return ChainResponse(
                 answer     = result["content"],
                 retrieval  = RetrievalResult([]),
@@ -359,12 +500,28 @@ class RAGChain:
                 query_type = "general",
             )
 
+        # ── Document-grounded RAG response ───────────────
+        logger.info(
+            "[RAG CHAIN] Building RAG prompt from %d passage(s), context=%d chars",
+            len(retrieval), len(context),
+        )
         self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
         prompt = self._build_prompt(question, context)
+        t_llm = time.perf_counter()
         result = self.llm.generate(
             prompt   = prompt,
             history  = self.history,
             store_as = question,
+        )
+        elapsed_llm = (time.perf_counter() - t_llm) * 1000
+        elapsed_total = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[RAG CHAIN] ✅ ask() complete — LLM=%.0f ms  total=%.0f ms  "
+            "tokens(prompt=%d  completion=%d  total=%d)",
+            elapsed_llm, elapsed_total,
+            result.get("usage", {}).get("prompt_tokens",     0),
+            result.get("usage", {}).get("completion_tokens", 0),
+            result.get("usage", {}).get("total_tokens",      0),
         )
         return ChainResponse(
             answer     = result["content"],
@@ -394,10 +551,19 @@ class RAGChain:
             ChainResponse    — final metadata object (online only)
             OfflineQueryResponse — all chunks at once (offline only)
         """
+        mode = "ONLINE" if is_online else "OFFLINE"
+        logger.info(
+            "[RAG CHAIN] stream() — mode=%s  has_kb=%s  question_len=%d",
+            mode, has_kb, len(question),
+        )
+        t0 = time.perf_counter()
 
         # ── OFFLINE BRANCH ────────────────────────────────
         if not is_online:
             if not has_kb:
+                logger.warning(
+                    "[RAG CHAIN] OFFLINE + no KB — returning empty OfflineQueryResponse"
+                )
                 yield OfflineQueryResponse(
                     query      = question,
                     chunks     = [],
@@ -408,8 +574,16 @@ class RAGChain:
 
             offline_top_k = settings.offline_top_k
             # _retrieve with is_offline=True returns child chunks directly
+            logger.info(
+                "[RAG CHAIN] OFFLINE retrieval — fetching top %d chunks",
+                offline_top_k,
+            )
             retrieval = self._retrieve(question, is_offline=True)
             chunks    = retrieval.get_chunks()[:offline_top_k]
+            logger.info(
+                "[RAG CHAIN] OFFLINE retrieval complete — %d chunks selected",
+                len(chunks),
+            )
 
             offline_chunks = [
                 OfflineChunk(
@@ -417,13 +591,8 @@ class RAGChain:
                     page         = c.get("page"),
                     heading      = c.get("heading", ""),
                     section_path = c.get("section_path", ""),
-                    # ── BUG 3 FIX ─────────────────────────────────────────
-                    # Previously used c.get("content") which is the raw 300-char
-                    # child fragment — unreadable mid-sentence snippets.
-                    # parent_content is the full 1500-char readable passage that
-                    # the hierarchical chunker stored inline on every child dict.
-                    # The `or` fallback handles atomic chunks (tables/images)
-                    # where parent_content == content — no regression there.
+                    # BUG 3 FIX: use parent_content (full 1500-char passage)
+                    # instead of raw child content (300-char fragment).
                     content      = c.get("parent_content") or c.get("content", ""),
                     score        = round(float(c.get("score", 0.0)), 4),
                     chunk_type   = c.get("type", "text"),
@@ -434,6 +603,11 @@ class RAGChain:
                 for c in chunks
             ]
 
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "[RAG CHAIN] ✅ OFFLINE stream() complete — %d chunks, %.0f ms",
+                len(offline_chunks), elapsed,
+            )
             yield OfflineQueryResponse(
                 query      = question,
                 chunks     = offline_chunks,
@@ -444,8 +618,11 @@ class RAGChain:
 
         # ── ONLINE BRANCH ─────────────────────────────────
 
-        # No KB
+        # No KB — general fallback
         if not has_kb:
+            logger.warning(
+                "[RAG CHAIN] ONLINE + no KB — streaming general fallback response"
+            )
             self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
             full_reply: list[str] = []
             usage: dict = {}
@@ -460,6 +637,11 @@ class RAGChain:
                 else:
                     usage = chunk.get("usage", {})
             self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "[RAG CHAIN] General fallback stream done — %.0f ms  tokens=%d",
+                elapsed, usage.get("total_tokens", 0),
+            )
             yield ChainResponse(
                 answer     = "".join(full_reply),
                 retrieval  = RetrievalResult([]),
@@ -470,15 +652,25 @@ class RAGChain:
             )
             return
 
-        # Retrieve + rerank children + expand to parents (online — A4)
+        # ── Retrieve + rerank children + expand to parents (online — A4) ─
         retrieval = self._retrieve(question, is_offline=False)
         context   = retrieval.to_context_string()
+        best_score = retrieval.best_score() if len(retrieval) > 0 else 0.0
+        logger.debug(
+            "[RAG CHAIN] Context: %d chars  best_score=%.4f",
+            len(context), best_score,
+        )
 
         # Weak context fallback
         if not context.strip() or (
             self.use_reranker
-            and retrieval.best_score() < MIN_RERANK_SCORE
+            and best_score < MIN_RERANK_SCORE
         ):
+            logger.warning(
+                "[RAG CHAIN] ⚠ Weak context (best_score=%.4f) — "
+                "streaming general fallback (no document grounding)",
+                best_score,
+            )
             self.llm.set_system_prompt(GENERAL_FALLBACK_PROMPT)
             full_reply = []
             usage = {}
@@ -493,6 +685,11 @@ class RAGChain:
                 else:
                     usage = chunk.get("usage", {})
             self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "[RAG CHAIN] Fallback stream done — %.0f ms  tokens=%d",
+                elapsed, usage.get("total_tokens", 0),
+            )
             yield ChainResponse(
                 answer     = "".join(full_reply),
                 retrieval  = RetrievalResult([]),
@@ -503,11 +700,18 @@ class RAGChain:
             )
             return
 
-        # Full RAG stream
+        # ── RAG-grounded stream ───────────────────────────
+        logger.info(
+            "[RAG CHAIN] Building RAG prompt — %d passage(s)  context=%d chars",
+            len(retrieval), len(context),
+        )
         self.llm.set_system_prompt(RAG_SYSTEM_PROMPT)
         prompt     = self._build_prompt(question, context)
         full_reply = []
-        usage      = {}
+        usage: dict = {}
+        token_count = 0
+
+        t_stream = time.perf_counter()
         for chunk in self.llm.stream(
             prompt   = prompt,
             history  = self.history,
@@ -515,9 +719,23 @@ class RAGChain:
         ):
             if isinstance(chunk, str):
                 full_reply.append(chunk)
+                token_count += 1
                 yield chunk
             else:
+                # Final metadata dict from the LLM
                 usage = chunk.get("usage", {})
+
+        elapsed_stream = (time.perf_counter() - t_stream) * 1000
+        elapsed_total  = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[RAG CHAIN] ✅ ONLINE stream() complete — "
+            "stream=%.0f ms  total=%.0f ms  "
+            "tokens(prompt=%d  completion=%d  total=%d)",
+            elapsed_stream, elapsed_total,
+            usage.get("prompt_tokens",     0),
+            usage.get("completion_tokens", 0),
+            usage.get("total_tokens",      0),
+        )
 
         yield ChainResponse(
             answer     = "".join(full_reply),
@@ -528,22 +746,27 @@ class RAGChain:
             query_type = "document",
         )
 
-    # ── MEMORY ────────────────────────────────────────────
-
-    def reset_memory(self) -> None:
-        self.llm.reset_history()
-        print("  [RAG CHAIN] Memory cleared.")
+    # ── SOURCE FILTER (pin) ───────────────────────────────
 
     def set_source_filter(self, filename: str) -> None:
+        """Pin retrieval to a single source file."""
+        logger.info("[RAG CHAIN] Source filter set → '%s'", filename)
         self._source_filter = filename
-        print(f"  [RAG CHAIN] Pinned to: '{filename}'")
 
     def clear_source_filter(self) -> None:
+        """Remove the source pin."""
+        logger.info("[RAG CHAIN] Source filter cleared (searching all documents)")
         self._source_filter = None
-        print(f"  [RAG CHAIN] Pin cleared")
 
     def get_source_filter(self) -> str | None:
         return self._source_filter
+
+    # ── MEMORY ────────────────────────────────────────────
+
+    def reset_memory(self) -> None:
+        """Clear conversation history and rolling summary."""
+        logger.info("[RAG CHAIN] Conversation memory reset")
+        self.llm.reset_history()
 
     def get_history(self) -> list[dict]:
         return self.history.to_messages()

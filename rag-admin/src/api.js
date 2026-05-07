@@ -6,6 +6,11 @@
 // Token is read from localStorage key 'admin_token'.
 // If ADMIN_TOKEN is empty on the server, the header is still sent
 // but the server ignores it (dev mode — no token required).
+//
+// CHANGE: Added fetchSyncStatus() and triggerSync().
+//   Sync endpoints live at /sync/status and /sync/trigger — NOT under /admin,
+//   so they use a separate BASE_SYNC constant and require no auth header.
+//   This mirrors exactly what rag-frontend/src/api.js does.
 
 const BASE = '/admin'
 
@@ -77,4 +82,22 @@ export async function adminWipe() {
     headers: authHeaders(),
   })
   return handleResponse(res)   // WipeResponse
+}
+
+// ── Sync status ───────────────────────────────────────────────
+// GET /sync/status — returns { last_synced, is_syncing, pending_count, message }
+// No auth required — matches rag-frontend/src/api.js exactly.
+export async function fetchSyncStatus() {
+  const res = await fetch(`/sync/status`)
+  if (!res.ok) throw new Error('Failed to fetch sync status')
+  return res.json()
+}
+
+// ── Trigger sync ──────────────────────────────────────────────
+// POST /sync/trigger — fires background sync, returns immediately.
+// No auth required — matches rag-frontend/src/api.js exactly.
+export async function triggerSync() {
+  const res = await fetch(`/sync/trigger`, { method: 'POST' })
+  if (!res.ok) throw new Error('Sync trigger failed')
+  return res.json()
 }

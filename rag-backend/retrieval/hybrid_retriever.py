@@ -41,6 +41,10 @@ from vectorstore.qdrant_store  import QdrantVectorStore
 from embeddings.embedder       import BaseEmbedder, EmbedderFactory
 from config                    import TOP_K, RRF_K
 
+# ── NEW: Logger for diagnostic retrieval comparison ────────────────────────
+from utils.logger import get_logger
+_log = get_logger("retrieval.hybrid_retriever")
+
 
 # ─────────────────────────────────────────────────────────
 # COSINE SIMILARITY HELPER
@@ -267,6 +271,29 @@ class HybridRetriever:
         # 3. BM25 search (always local — BM25 index is local)
         sparse_results = self.bm25.search(query=query, top_k=fetch_k)
 
+        # ── NEW: Log raw candidate counts and a few samples ───────────────
+        mode_str = "OFFLINE" if is_offline else "ONLINE"
+        store_tag = "cloud" if (store and store is not self.store) else "local"
+        _log.debug(
+            "[HYBRID/RETRIEVE] %s | store=%s | dense=%d  sparse=%d  fetch_k=%d",
+            mode_str, store_tag, len(dense_results), len(sparse_results), fetch_k,
+        )
+        # Log first 3 dense + sparse results for traceability
+        for i, d in enumerate(dense_results[:3]):
+            _log.debug(
+                "[HYBRID/RETRIEVE] DENSE[%d] src=%s p=%s score=.4f content_preview=%r",
+                i, d.get("source", "?"), d.get("page", "?"),
+                d.get("score", 0.0),
+                (d.get("content", "")[:60]).replace("\n", " "),
+            )
+        for i, s in enumerate(sparse_results[:3]):
+            _log.debug(
+                "[HYBRID/RETRIEVE] SPARSE[%d] src=%s p=%s score=%.4f content_preview=%r",
+                i, s.get("source", "?"), s.get("page", "?"),
+                s.get("score", 0.0),
+                (s.get("content", "")[:60]).replace("\n", " "),
+            )
+
         # 4. RRF fusion
         fused = reciprocal_rank_fusion(
             dense_results  = dense_results,
@@ -275,6 +302,18 @@ class HybridRetriever:
             dense_weight   = self.dense_weight,
             sparse_weight  = self.sparse_weight,
         )
+
+        # ── NEW: Log fused list (before MMR) ──────────────────────────────
+        _log.debug(
+            "[HYBRID/RETRIEVE] Fused %d chunks (before MMR)", len(fused)
+        )
+        for i, f in enumerate(fused[:5]):
+            _log.debug(
+                "[HYBRID/RETRIEVE] FUSED[%d] src=%s p=%s rrf=%.6f content_preview=%r",
+                i, f.get("source", "?"), f.get("page", "?"),
+                f.get("rrf_score", 0.0),
+                (f.get("content", "")[:60]).replace("\n", " "),
+            )
 
         # 5. Score threshold filter
         if self.score_threshold > 0:
@@ -289,6 +328,19 @@ class HybridRetriever:
             )
         else:
             fused = fused[:k]
+
+        # ── NEW: Log final MMR‑filtered list ──────────────────────────────
+        _log.debug(
+            "[HYBRID/RETRIEVE] After MMR: %d chunks (mode=%s store=%s)",
+            len(fused), mode_str, store_tag,
+        )
+        for i, f in enumerate(fused):
+            _log.debug(
+                "[HYBRID/RETRIEVE] FINAL[%d] src=%s p=%s score=%.4f content_preview=%r",
+                i, f.get("source", "?"), f.get("page", "?"),
+                f.get("score", 0.0),
+                (f.get("content", "")[:60]).replace("\n", " "),
+            )
 
         mode = "offline" if is_offline else "online (rerank + expand in chain)"
         store_tag = "cloud" if (store and store is not self.store) else "local"

@@ -1,24 +1,39 @@
-# routers/ingest.py
+# rag-backend/routers/ingest.py
 #
-# CHANGES vs previous version:
+# SYNC FIX — Re-upload / overwrite of same-named PDF now always re-indexes:
 #
-#   Supabase Storage integration (new — backward compatible):
-#     After a PDF is successfully chunked and indexed, it is uploaded to the
-#     configured Supabase public bucket.  The permanent public URL is then
-#     injected into every chunk's metadata as "source_url" before the chunks
-#     are written to the vector store.
+#   ROOT CAUSE:
+#     The SHA-256 hash registry (file_hashes.json) maps sha256 → filename.
+#     When an admin uploads a PDF whose content bytes are identical to a
+#     previously indexed version (common when re-uploading after a failed sync
+#     or when testing), `fhash in hashes` was True and the file was silently
+#     skipped as a "duplicate" — even though the admin explicitly chose to
+#     upload it again.
 #
-#     If Supabase is NOT configured (SUPABASE_URL / SUPABASE_SERVICE_KEY empty),
-#     the upload step is skipped silently and "source_url" is set to "" so
-#     existing behaviour is completely unchanged.
+#     More critically, when an admin:
+#       1. Uploads PDF v1 (indexed, hash H1 stored)
+#       2. Modifies the PDF and uploads v2 (different bytes, hash H2, indexed OK)
+#       3. Wants to re-upload v1 (same bytes as step 1, hash H1 still in registry)
+#     Step 3 was silently skipped. The app never got the updated KB.
 #
-#   Key changes inside _ingest_files_sync():
-#     1. After chunking, call upload_pdf_to_supabase(tmp_path) → public_url.
-#     2. Inject "source_url": public_url into every chunk dict.
-#     3. Then index as before.
+#     The hash registry's purpose is to prevent duplicate ingestion of the
+#     SAME file uploaded TWICE IN THE SAME BATCH (e.g. user drags two copies
+#     of the same file). It was never meant to block intentional re-uploads.
 #
-# Everything else (duplicate detection, PDF viewer copy, delete logic,
-# hash registry, etc.) is UNCHANGED.
+#   FIX:
+#     Before the duplicate check, if the incoming filename already exists in
+#     the knowledge base (Qdrant + BM25), delete it first. This is the same
+#     operation as a manual DELETE followed by a new ingest — but automatic.
+#
+#     Additionally remove any old hash registry entries for this filename
+#     before the duplicate check, so the same-content re-upload is always
+#     treated as fresh.
+#
+#     The net effect: uploading a PDF always indexes it, whether the content
+#     changed or not. The only "skip" that remains is when the SAME file
+#     appears TWICE in the SAME upload batch (truly accidental duplicate).
+#
+# ALL OTHER LOGIC IS UNCHANGED.
 
 import hashlib
 import json
@@ -41,7 +56,7 @@ router = APIRouter(tags=["ingest"])
 # ── Hash registry ─────────────────────────────────────────────
 _HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
 
-# ── PDFs directory (A5) ───────────────────────────────────────
+# ── PDFs directory ────────────────────────────────────────────
 _PDFS_DIR  = Path(PDFS_DIR)
 
 
@@ -70,7 +85,7 @@ def _remove_hash_for_file(filename: str) -> None:
     _save_hashes(updated)
 
 
-# ── PDF file management (A5) ──────────────────────────────────
+# ── PDF file management ───────────────────────────────────────
 
 def _store_pdf_file(tmp_path: str, filename: str) -> Path | None:
     _PDFS_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,18 +125,19 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
     Ingest one or more files into the vector store.
 
     For each PDF:
-      1. Duplicate check (SHA-256).
-      2. Load blocks via PDFLoader.
-      3. Chunk (hierarchical or other strategy).
-      4. [NEW] Upload to Supabase Storage → get public_url (skipped if not configured).
-      5. [NEW] Inject source_url into every chunk dict.
-      6. Add chunks to vector store + BM25.
-      7. Copy PDF to data/pdfs/ for the local viewer.
-
-    The source_url field is "" when Supabase is not configured so downstream
-    code (sync engine, frontend) can safely check its truthiness.
+      1. [FIX] Remove existing vectors/BM25 chunks for this filename BEFORE
+         the duplicate hash check. This ensures re-uploading the same filename
+         always produces a fresh index — even if the bytes are identical to the
+         previously stored version.
+      2. Duplicate check (SHA-256) — now only guards against the same file
+         appearing TWICE in the SAME upload batch, not across sessions.
+      3. Load blocks via PDFLoader.
+      4. Chunk (hierarchical or other strategy).
+      5. [Supabase] Upload to Supabase Storage → get public_url (skipped if not configured).
+      6. [Supabase] Inject source_url into every chunk dict.
+      7. Add chunks to vector store + BM25.
+      8. Copy PDF to data/pdfs/ for the local viewer.
     """
-    # ── Import Supabase helper (lazy — avoids import errors if requests not installed)
     try:
         from services.supabase_storage import upload_pdf_to_supabase
         _supabase_import_ok = True
@@ -138,7 +154,7 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
     skipped       : list[str] = []
     all_children  : list[dict] = []
 
-    # Save original PDF for viewer (early pass — keeps existing behaviour)
+    # Save original PDFs for viewer (early pass — keeps existing behaviour)
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for tmp_path_str, filename in file_paths:
@@ -146,17 +162,50 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         if tmp_path.exists():
             shutil.copy2(tmp_path, pdfs_dir / filename)
 
+    # Track sha256s seen in THIS batch only — prevents same file twice in one upload
+    batch_hashes: set[str] = set()
+
     for tmp_path, filename in file_paths:
-        # ── 1. Duplicate check ────────────────────────────
+
+        # ── FIX 1: Remove existing data for this filename BEFORE the hash check
+        # ─────────────────────────────────────────────────────────────────────
+        # If this filename was previously indexed, wipe it from all stores first.
+        # This ensures an admin re-uploading the same filename always gets a
+        # fresh index — regardless of whether the bytes changed.
+        #
+        # This is safe because:
+        #   a) We immediately re-index it below if the content is valid.
+        #   b) The admin explicitly uploaded it, so they want it indexed.
+        #   c) The worst case (upload fails after wipe) leaves the KB without
+        #      this file — the same state as a manual delete, and no worse than
+        #      before this fix where the old data silently persisted.
+        #
+        existing_sources = vector_store.list_sources()
+        if filename in existing_sources:
+            print(f"  [INGEST] Overwrite detected for '{filename}' — removing old vectors and BM25 entries")
+            vector_store.delete_by_source(filename)
+            bm25_store.delete_by_source(filename)
+            _remove_hash_for_file(filename)
+            # Reload hashes after removal so the check below uses the clean state
+            hashes = _load_hashes()
+            print(f"  [INGEST] Old data cleared for '{filename}' — re-indexing fresh")
+
+        # ── 2. Duplicate check (within THIS batch only after fix above)
+        # ─────────────────────────────────────────────────────────────────────
         raw   = Path(tmp_path).read_bytes()
         fhash = hashlib.sha256(raw).hexdigest()
 
-        if fhash in hashes:
-            print(f"  [INGEST] Skipping duplicate: {filename}")
+        if fhash in batch_hashes:
+            # Same file uploaded twice in the SAME batch — this is the only
+            # case we now skip. Cross-session duplicates are handled by the
+            # overwrite logic above.
+            print(f"  [INGEST] Skipping duplicate in batch: {filename}")
             skipped.append(filename)
             continue
 
-        # ── 2. Load ───────────────────────────────────────
+        batch_hashes.add(fhash)
+
+        # ── 3. Load ───────────────────────────────────────
         loader = _get_loader(tmp_path, filename)
         if not loader:
             print(f"  [INGEST] Unsupported file type: {filename}")
@@ -177,43 +226,27 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         for b in blocks:
             b["source"] = filename
 
-        # ── 3. Chunk ──────────────────────────────────────
+        # ── 4. Chunk ──────────────────────────────────────
         from ingestion.chunker import HierarchicalChunker
         if isinstance(chunker, HierarchicalChunker):
             children = chunker.chunk_hierarchical(blocks)
         else:
             children = chunker.chunk_documents(blocks)
 
-        # ── 4. Upload to Supabase Storage ─────────────────
-        # Attempt upload only for PDFs and only when Supabase is configured.
-        # On failure we log and continue — ingestion is not blocked.
+        # ── 5. Upload to Supabase Storage ─────────────────
         source_url = ""
         if _supabase_import_ok and Path(filename).suffix.lower() == ".pdf":
             try:
                 public_url = upload_pdf_to_supabase(tmp_path)
                 if public_url:
                     source_url = public_url
-                    # Log once per file (not per chunk)
-                    print(
-                        f"  [INGEST] [SUPABASE] source_url set for "
-                        f"'{filename}': {source_url}"
-                    )
+                    print(f"  [INGEST] [SUPABASE] source_url set for '{filename}': {source_url}")
                 else:
-                    print(
-                        f"  [INGEST] [SUPABASE] Upload returned None for "
-                        f"'{filename}' — source_url left empty"
-                    )
+                    print(f"  [INGEST] [SUPABASE] Upload returned None for '{filename}' — source_url left empty")
             except Exception as exc:
-                print(
-                    f"  [INGEST] [SUPABASE] Upload exception for "
-                    f"'{filename}': {exc} — continuing without source_url"
-                )
+                print(f"  [INGEST] [SUPABASE] Upload exception for '{filename}': {exc} — continuing without source_url")
 
-        # ── 5. Inject source_url into every chunk ─────────
-        # This happens regardless of whether upload succeeded:
-        #   - source_url = "<public_url>"  → Supabase upload succeeded
-        #   - source_url = ""              → Supabase not configured or failed
-        # Downstream code can always do: chunk.get("source_url") or ""
+        # ── 6. Inject source_url into every chunk ─────────
         for child in children:
             child["source_url"] = source_url
 
@@ -221,11 +254,11 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         files_indexed.append(filename)
         hashes[fhash] = filename
 
-        # ── 6. Copy PDF to local viewer store ────────────
+        # ── 7. Copy PDF to local viewer store ─────────────
         if Path(filename).suffix.lower() == ".pdf":
             _store_pdf_file(tmp_path, filename)
 
-    # ── 7. Index all chunks ───────────────────────────────
+    # ── 8. Index all new chunks ───────────────────────────
     if all_children:
         vector_store.add_documents(all_children)
         bm25_store.add(all_children)
@@ -304,7 +337,6 @@ async def delete_file(filename: str):
         so deleting locally would cause permanent data divergence on reconnect).
     """
 
-    # ── Guard 1: must be online ───────────────────────────
     if not rag_service.is_online():
         raise HTTPException(
             status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -315,7 +347,6 @@ async def delete_file(filename: str):
             ),
         )
 
-    # ── Guard 2: cloud store must be configured ───────────
     cloud_store = rag_service.get_cloud_store()
     if cloud_store is None:
         raise HTTPException(
@@ -326,7 +357,6 @@ async def delete_file(filename: str):
             ),
         )
 
-    # ── Guard 3: file must exist in cloud ─────────────────
     cloud_sources = cloud_store.list_sources()
     if filename not in cloud_sources:
         raise HTTPException(
@@ -334,10 +364,8 @@ async def delete_file(filename: str):
             detail      = f"File '{filename}' not found in the cloud knowledge base.",
         )
 
-    # ── Delete from cloud ─────────────────────────────────
     result = await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
 
-    # ── Clean up local side effects immediately ───────────
     _remove_hash_for_file(filename)
     _delete_pdf_file(filename)
 

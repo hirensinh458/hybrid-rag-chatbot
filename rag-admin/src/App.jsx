@@ -1,19 +1,21 @@
 // src/App.jsx
 //
-// Admin panel root.
+// CHANGE: Added SyncPanel component in the left column (below StatsPanel).
 //
-// Flow:
-//   1. On load, reads admin_token from localStorage and tries GET /admin/stats.
-//      - If it returns 200  → show the main panel.
-//      - If it returns 401  → show the login / token-entry screen.
-//      - If ADMIN_TOKEN is empty on the server → 200 (dev mode, no token needed).
-//   2. Main panel has two columns:
-//      - Left : StatsPanel (system stats)
-//      - Right: FileManager (upload, file list, delete, wipe)
-//   3. Refresh button at top re-fetches stats + file list.
+//   Behaviour is identical to the Sync section in rag-frontend/src/components/Sidebar.jsx:
+//     - Fetches sync status from GET /sync/status on mount and after each refresh.
+//     - Shows: last synced timestamp, pending_count badge, is_syncing indicator.
+//     - "Sync now" button calls POST /sync/trigger (fires background sync).
+//     - Button is disabled while a sync is in progress or the backend is unreachable.
+//     - After triggering, polls /sync/status every 3 s for up to 30 s so the
+//       "Last synced" timestamp updates live once the background job finishes.
+//       (rag-frontend does a single 3 s setTimeout; we do the same but also poll
+//       a few extra times so the admin panel always shows the final result.)
+//
+// Everything else (auth, StatsPanel, FileManager, topbar) is UNCHANGED.
 
-import { useState, useEffect, useCallback } from 'react'
-import { adminStats, adminListFiles } from './api'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { adminStats, adminListFiles, fetchSyncStatus, triggerSync } from './api'
 import FileManager from './components/FileManager'
 import StatsPanel  from './components/StatsPanel'
 
@@ -25,6 +27,13 @@ export default function App() {
   const [stats,       setStats]       = useState(null)
   const [files,       setFiles]       = useState([])
   const [loading,     setLoading]     = useState(false)
+
+  // ── Sync state ──────────────────────────────────────────────────
+  const [syncStatus,   setSyncStatus]   = useState(null)   // { last_synced, is_syncing, pending_count }
+  const [syncing,      setSyncing]      = useState(false)   // local button-busy flag
+  const [syncError,    setSyncError]    = useState('')
+  const [syncSuccess,  setSyncSuccess]  = useState('')
+  const pollRef = useRef(null)          // stores interval id for polling cleanup
 
   // ── Fetch stats + files ────────────────────────────────────────
   const fetchData = useCallback(async () => {
@@ -42,6 +51,16 @@ export default function App() {
     }
   }, [])
 
+  // ── Fetch sync status (standalone, non-fatal) ──────────────────
+  const refreshSyncStatus = useCallback(async () => {
+    try {
+      const s = await fetchSyncStatus()
+      setSyncStatus(s)
+    } catch {
+      // sync not configured or backend not reachable — silently ignore
+    }
+  }, [])
+
   // ── Check auth on mount ────────────────────────────────────────
   useEffect(() => {
     const check = async () => {
@@ -49,8 +68,7 @@ export default function App() {
         await adminStats()
         setAuthed(true)
         setAuthChecked(true)
-      } catch (e) {
-        // 401 → show login. Any other error (backend down) → also show login.
+      } catch {
         setAuthed(false)
         setAuthChecked(true)
       }
@@ -60,8 +78,18 @@ export default function App() {
 
   // ── Load data once authed ──────────────────────────────────────
   useEffect(() => {
-    if (authed) fetchData()
-  }, [authed, fetchData])
+    if (authed) {
+      fetchData()
+      refreshSyncStatus()
+    }
+  }, [authed, fetchData, refreshSyncStatus])
+
+  // ── Stop any pending poll on unmount ──────────────────────────
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current)
+    }
+  }, [])
 
   // ── Token submit ───────────────────────────────────────────────
   const handleLogin = async (e) => {
@@ -82,6 +110,61 @@ export default function App() {
     setAuthed(false)
     setStats(null)
     setFiles([])
+    setSyncStatus(null)
+  }
+
+  // ── Sync now ──────────────────────────────────────────────────
+  // Mirrors rag-frontend Sidebar.doSync() exactly, with an added polling
+  // loop so the "Last synced" timestamp updates once the job finishes.
+  const handleSyncNow = async () => {
+    if (syncing || syncStatus?.is_syncing) return
+    setSyncing(true)
+    setSyncError('')
+    setSyncSuccess('')
+
+    // Clear any previous poll
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+
+    try {
+      await triggerSync()
+
+      // Poll /sync/status every 3 s for up to 30 s (10 attempts).
+      // Once is_syncing flips to false we refresh stats and stop polling.
+      let attempts = 0
+      pollRef.current = setInterval(async () => {
+        attempts++
+        try {
+          const s = await fetchSyncStatus()
+          setSyncStatus(s)
+
+          // Sync finished or max attempts reached
+          if (!s.is_syncing || attempts >= 10) {
+            clearInterval(pollRef.current)
+            pollRef.current = null
+            setSyncing(false)
+            if (!s.is_syncing) {
+              setSyncSuccess('Sync complete')
+              // Refresh stats so vector count updates immediately
+              fetchData()
+              // Clear success message after 4 s
+              setTimeout(() => setSyncSuccess(''), 4000)
+            }
+          }
+        } catch {
+          // Poll failed — stop and surface nothing (non-fatal)
+          clearInterval(pollRef.current)
+          pollRef.current = null
+          setSyncing(false)
+        }
+      }, 3000)
+
+    } catch (e) {
+      setSyncing(false)
+      setSyncError(e.message || 'Sync trigger failed')
+    }
   }
 
   // ── Loading spinner (initial auth check) ──────────────────────
@@ -224,7 +307,7 @@ export default function App() {
           <button
             onClick={fetchData}
             disabled={loading}
-            title="Refresh"
+            title="Refresh stats and file list"
             style={{
               width: 32, height: 32, borderRadius: 'var(--r-md)',
               border: '1px solid var(--border-md)', background: 'transparent',
@@ -264,11 +347,21 @@ export default function App() {
         maxWidth: 1100, width: '100%', margin: '0 auto',
       }}>
 
-        {/* Left column — Stats */}
+        {/* Left column — Stats + Sync */}
         <aside style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <StatsPanel stats={stats} />
 
-          {/* Connection info */}
+          {/* ── SYNC PANEL — new, mirrors rag-frontend Sidebar sync section ── */}
+          <SyncPanel
+            syncStatus={syncStatus}
+            syncing={syncing}
+            syncError={syncError}
+            syncSuccess={syncSuccess}
+            onSyncNow={handleSyncNow}
+            onRefreshStatus={refreshSyncStatus}
+          />
+
+          {/* Connection info (unchanged) */}
           <div style={{
             background: 'var(--bg-2)', border: '1px solid var(--border)',
             borderRadius: 'var(--r-lg)', padding: '14px 16px',
@@ -295,7 +388,7 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Right column — File manager */}
+        {/* Right column — File manager (unchanged) */}
         <section style={{
           background: 'var(--bg-1)', border: '1px solid var(--border)',
           borderRadius: 'var(--r-xl)', padding: '24px',
@@ -325,6 +418,189 @@ export default function App() {
     </div>
   )
 }
+
+
+// ── SyncPanel ─────────────────────────────────────────────────────────────────
+//
+// Self-contained component that mirrors the Sync section in rag-frontend's
+// Sidebar.jsx (lines 10710–10738 of that file) — same layout, same labels,
+// same disabled logic, same "Syncing…" text while busy.
+//
+// Props:
+//   syncStatus   — { last_synced: string|null, is_syncing: bool, pending_count: int }
+//   syncing      — local button-busy flag (set while triggerSync() is in flight)
+//   syncError    — error string to show, or ''
+//   syncSuccess  — success string to show, or ''
+//   onSyncNow    — callback: fires triggerSync and starts polling
+//   onRefreshStatus — callback: re-fetches /sync/status
+
+function SyncPanel({ syncStatus, syncing, syncError, syncSuccess, onSyncNow, onRefreshStatus }) {
+  const isDisabled = syncing || syncStatus?.is_syncing
+
+  const formatTime = (iso) => {
+    if (!iso) return '—'
+    try {
+      return new Date(iso).toLocaleString()
+    } catch {
+      return iso
+    }
+  }
+
+  return (
+    <div style={{
+      background: 'var(--bg-2)', border: '1px solid var(--border)',
+      borderRadius: 'var(--r-lg)', overflow: 'hidden',
+    }}>
+      {/* ── Header ── */}
+      <div style={{
+        padding: '12px 16px',
+        borderBottom: '1px solid var(--border)',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: '1rem' }}>🔄</span>
+          <span style={{
+            fontFamily: 'var(--font-display)', fontWeight: 700,
+            fontSize: '.85rem', color: 'var(--text-0)',
+          }}>Cloud Sync</span>
+        </div>
+
+        {/* Small refresh icon to re-fetch status without triggering a sync */}
+        <button
+          onClick={onRefreshStatus}
+          title="Refresh sync status"
+          style={{
+            width: 24, height: 24, borderRadius: 'var(--r-sm)',
+            border: '1px solid var(--border)', background: 'transparent',
+            cursor: 'pointer', color: 'var(--text-3)', fontSize: '.75rem',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            transition: 'color .15s',
+          }}
+          onMouseEnter={e => e.currentTarget.style.color = 'var(--text-1)'}
+          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-3)'}
+        >
+          ↻
+        </button>
+      </div>
+
+      {/* ── Status rows — identical to rag-frontend Sidebar ── */}
+      <div style={{ padding: '10px 16px 4px' }}>
+
+        {/* Last synced timestamp */}
+        <div style={{
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          marginBottom: 6, fontSize: '.72rem',
+        }}>
+          <span style={{ color: 'var(--text-3)' }}>Last synced</span>
+          <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-text)', fontSize: '.68rem' }}>
+            {syncStatus ? formatTime(syncStatus.last_synced) : '—'}
+          </span>
+        </div>
+
+        {/* Pending docs badge — shown only when > 0 */}
+        {syncStatus?.pending_count > 0 && (
+          <div style={{
+            fontSize: '.68rem', color: 'var(--warn)',
+            background: 'var(--warn-bg)', border: '1px solid var(--warn-border)',
+            borderRadius: 'var(--r-sm)', padding: '4px 8px',
+            marginBottom: 6, fontFamily: 'var(--font-mono)',
+          }}>
+            {syncStatus.pending_count} doc{syncStatus.pending_count > 1 ? 's' : ''} pending sync
+          </div>
+        )}
+
+        {/* "Syncing…" live indicator — shown when backend reports is_syncing */}
+        {syncStatus?.is_syncing && (
+          <div style={{
+            fontSize: '.68rem', color: 'var(--teal)',
+            display: 'flex', alignItems: 'center', gap: 6,
+            marginBottom: 6,
+          }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: '50%',
+              background: 'var(--teal)',
+              animation: 'pulse 1s ease infinite', flexShrink: 0,
+            }} />
+            Syncing…
+          </div>
+        )}
+
+        {/* Error message */}
+        {syncError && (
+          <div style={{
+            fontSize: '.68rem', color: 'var(--danger)',
+            background: 'var(--danger-bg)', border: '1px solid var(--danger-border)',
+            borderRadius: 'var(--r-sm)', padding: '4px 8px',
+            marginBottom: 6, fontFamily: 'var(--font-mono)',
+          }}>
+            {syncError}
+          </div>
+        )}
+
+        {/* Success message */}
+        {syncSuccess && (
+          <div style={{
+            fontSize: '.68rem', color: 'var(--success)',
+            background: 'var(--success-bg)', border: '1px solid var(--success-border)',
+            borderRadius: 'var(--r-sm)', padding: '4px 8px',
+            marginBottom: 6, fontFamily: 'var(--font-mono)',
+            display: 'flex', alignItems: 'center', gap: 5,
+          }}>
+            <span>✓</span> {syncSuccess}
+          </div>
+        )}
+      </div>
+
+      {/* ── Sync Now button — same disabled logic as rag-frontend ── */}
+      <div style={{ padding: '4px 16px 14px' }}>
+        <button
+          onClick={onSyncNow}
+          disabled={isDisabled}
+          title={
+            syncStatus?.is_syncing
+              ? 'Sync already running on the server'
+              : syncing
+              ? 'Waiting for sync to complete…'
+              : 'Pull latest documents from the cloud store'
+          }
+          style={{
+            width: '100%', padding: '9px 0',
+            background: isDisabled
+              ? 'var(--bg-3)'
+              : 'linear-gradient(135deg, var(--accent), var(--accent-dim))',
+            border: isDisabled ? '1px solid var(--border-md)' : 'none',
+            borderRadius: 'var(--r-md)',
+            color: isDisabled ? 'var(--text-3)' : '#fff',
+            cursor: isDisabled ? 'not-allowed' : 'pointer',
+            fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '.78rem',
+            opacity: isDisabled ? .6 : 1,
+            transition: 'all .15s',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7,
+          }}
+        >
+          {/* Spinner while syncing, static icon otherwise */}
+          {(syncing || syncStatus?.is_syncing) ? (
+            <>
+              <span style={{
+                width: 12, height: 12, borderRadius: '50%',
+                border: '2px solid rgba(255,255,255,.3)',
+                borderTopColor: isDisabled ? 'var(--text-3)' : '#fff',
+                animation: 'spin .7s linear infinite', display: 'inline-block',
+              }} />
+              Syncing…
+            </>
+          ) : (
+            <>
+              <span>⇄</span>
+              Sync now
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 
 // ── Logo ──────────────────────────────────────────────────────
 function Logo() {

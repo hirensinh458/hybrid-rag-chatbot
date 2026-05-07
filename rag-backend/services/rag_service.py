@@ -169,7 +169,8 @@ def _build_chain() -> RAGChain:
         reranker       = _reranker,
         use_reranker   = True,
         retrieve_top_k = settings.top_k,
-        rerank_top_k   = 5,
+        rerank_top_k   = settings.reranker_top_k,
+        # parent_rerank_top_k is read from settings inside RAGChain.__init__
         cite_sources   = True,
     )
 

@@ -18,14 +18,22 @@
 #
 # CHANGE — Add /chat/offline endpoint (Mode 2 fix):
 #   - Mobile app calls POST /chat/offline which previously returned 404.
-#   - This endpoint accepts the same ChatRequest body and forces offline mode,
-#     bypassing rag_service.is_online() entirely.
-#   - This lets the mobile app explicitly request offline retrieval even if
-#     the server's NetworkMonitor hasn't detected the state change yet.
+#   - This endpoint accepts the same ChatRequest body and forces offline mode.
 #   - The offline retrieval + reranker logic is identical to the offline branch
 #     in /chat/stream — both paths use the same shared helpers.
+#
+# LOGGING CHANGES:
+#   - Every request logs mode (ONLINE/OFFLINE/MODE2), question length, and
+#     KB availability at INFO.
+#   - Token streaming is logged at DEBUG — first token arrival marks when
+#     the LLM started generating (useful for measuring LLM latency).
+#   - Each offline chunk's source/page/score is logged at DEBUG for
+#     easy comparison when tuning retrieval quality.
+#   - SSE generator exceptions are logged at ERROR with full traceback.
+#   - Session/pin operations are logged at INFO.
 
 import json
+import time
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -35,6 +43,9 @@ from pydantic import BaseModel
 from schemas import ChatRequest, ClearRequest, OfflineQueryResponse, OfflineChunk
 from services import rag_service
 from config import settings
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["chat"])
 
@@ -64,6 +75,15 @@ def _run_offline_retrieval(question: str, chain, active_store) -> list:
     -------
     list[dict]   : final ranked chunks ready to be serialised as OfflineChunk
     """
+    logger.info(
+        "[CHAT/OFFLINE] Starting offline retrieval — top_k=%d  "
+        "reranker=%s  source_filter=%s",
+        settings.top_k,
+        "enabled" if settings.enable_offline_reranker else "disabled",
+        chain.get_source_filter() or "none",
+    )
+    t0 = time.perf_counter()
+
     retriever = chain.retriever
 
     retrieval = retriever.retrieve(
@@ -74,44 +94,80 @@ def _run_offline_retrieval(question: str, chain, active_store) -> list:
         is_offline   = True,
         store        = active_store,
     )
+    elapsed_retrieve = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "[CHAT/OFFLINE] Initial retrieval: %d chunks in %.0f ms",
+        len(retrieval), elapsed_retrieve,
+    )
 
-    # AFTER
     if settings.enable_offline_reranker:
         reranker = rag_service.get_reranker()
+
+        # RERANK #1 — score child chunks (300-tok, precise fragments)
+        t_r1 = time.perf_counter()
         reranked = reranker.rerank(
             query     = question,
             retrieval = retrieval,
-            top_k     = settings.reranker_top_k,
+            top_k     = settings.reranker_top_k,          # e.g. 20 → 10
         )
-        # expand_to_parents() replaces content with parent_content and
-        # deduplicates by parent_id — unique parents only, order preserved
-        expanded     = retriever.expand_to_parents(reranked)
-        final_chunks = expanded.get_chunks()
-        print(
-            f"  [CHAT/OFFLINE] Reranker ON — "
-            f"{len(retrieval)} candidates → {len(reranked)} reranked → "
-            f"{len(final_chunks)} unique parent chunks"
+        elapsed_r1 = (time.perf_counter() - t_r1) * 1000
+        logger.info(
+            "[CHAT/OFFLINE] Rerank #1 done — %d children kept (%.0f ms)",
+            len(reranked), elapsed_r1,
+        )
+
+        # EXPAND — replace child content with full parent passage (1500-tok)
+        t_expand = time.perf_counter()
+        expanded = retriever.expand_to_parents(reranked)
+        elapsed_expand = (time.perf_counter() - t_expand) * 1000
+        logger.info(
+            "[CHAT/OFFLINE] Parent expansion: %d → %d passages (%.0f ms)",
+            len(reranked), len(expanded), elapsed_expand,
+        )
+
+        # RERANK #2 — score parent passages (1500-tok, full context)
+        # The cross-encoder now sees the complete passage, not a fragment.
+        t_r2 = time.perf_counter()
+        reranked2    = reranker.rerank(
+            query     = question,
+            retrieval = expanded,
+            top_k     = settings.parent_rerank_top_k,     # e.g. 10 → 5
+        )
+        elapsed_r2 = (time.perf_counter() - t_r2) * 1000
+        final_chunks = reranked2.get_chunks()
+        logger.info(
+            "[CHAT/OFFLINE] Rerank #2 done — %d parent chunks kept (%.0f ms)",
+            len(final_chunks), elapsed_r2,
         )
     else:
         final_chunks = retrieval.get_chunks()[:settings.offline_top_k]
-        print(
-            f"  [CHAT/OFFLINE] Reranker OFF — "
-            f"returning top {len(final_chunks)} MMR child chunks (no parent expansion)"
+        logger.info(
+            "[CHAT/OFFLINE] Reranker OFF — returning top %d MMR child chunks "
+            "(no parent expansion)",
+            len(final_chunks),
         )
 
-    # Log chunk ordering for comparison (toggle ENABLE_OFFLINE_RERANKER to see the difference)
+    # Log chunk ordering at DEBUG so retrieval quality can be inspected
     for i, c in enumerate(final_chunks):
-        score_label = (
-            f"rerank={c.get('rerank_score', '?'):.4f}"
-            if settings.enable_offline_reranker
-            else f"rrf={c.get('rrf_score', c.get('score', '?'))}"
-        )
-        print(
-            f"  [CHAT/OFFLINE] chunk[{i}] {score_label} "
-            f"src={c.get('source','?')} p={c.get('page','?')} "
-            f"| {c.get('content','')[:80].replace(chr(10),' ')!r}"
+        if settings.enable_offline_reranker:
+            score_label = f"rerank={c.get('rerank_score', '?'):.4f}"
+        else:
+            score_label = f"rrf={c.get('rrf_score', c.get('score', '?'))}"
+        logger.debug(
+            "[CHAT/OFFLINE] chunk[%d] %s  src=%s  p=%s  "
+            "content_preview=%r",
+            i, score_label,
+            c.get("source", "?"),
+            c.get("page",   "?"),
+            c.get("content", "")[:60].replace("\n", " "),
         )
 
+    total_elapsed = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "[CHAT/OFFLINE] _run_offline_retrieval complete — "
+        "%d chunks  total=%.0f ms",
+        len(final_chunks), total_elapsed,
+    )
     return final_chunks
 
 
@@ -119,6 +175,10 @@ def _build_offline_response(question: str, final_chunks: list) -> OfflineQueryRe
     """
     Convert a list of raw chunk dicts into a fully populated OfflineQueryResponse.
     """
+    logger.debug(
+        "[CHAT/OFFLINE] Building OfflineQueryResponse from %d chunks",
+        len(final_chunks),
+    )
     offline_chunks = [
         OfflineChunk(
             source       = c.get("source", "unknown"),
@@ -157,9 +217,17 @@ async def chat_stream(req: ChatRequest):
     chain        = rag_service.get_chain()
     online       = rag_service.is_online()
 
+    logger.info(
+        "[CHAT] /chat/stream — mode=%s  has_kb=%s  question_len=%d",
+        "ONLINE" if online else "OFFLINE",
+        has_kb,
+        len(req.question),
+    )
+
     # ── OFFLINE ───────────────────────────────────────────
     if not online:
         if not has_kb:
+            logger.warning("[CHAT] OFFLINE + no KB — returning empty response")
             result = OfflineQueryResponse(
                 query      = req.question,
                 chunks     = [],
@@ -170,19 +238,45 @@ async def chat_stream(req: ChatRequest):
 
         # Import active store so offline path uses local store (same as chain)
         active_store = rag_service.get_local_store()
+        logger.info(
+            "[CHAT] OFFLINE — using local store (%s)  count=%d",
+            type(active_store).__name__,
+            active_store.count(),
+        )
 
+        t0 = time.perf_counter()
         final_chunks = _run_offline_retrieval(req.question, chain, active_store)
         result       = _build_offline_response(req.question, final_chunks)
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[CHAT] ✅ OFFLINE response ready — %d chunks  %.0f ms",
+            result.total, elapsed,
+        )
         return JSONResponse(content=result.model_dump())
 
     # ── ONLINE (SSE stream) ────────────────────────────────
+    logger.info("[CHAT] ONLINE — starting SSE stream...")
+
     async def event_generator():
+        t_start = time.perf_counter()
+        token_count = 0
+        first_token_logged = False
+
         try:
             for chunk in chain.stream(req.question, has_kb=has_kb, is_online=True):
                 if isinstance(chunk, str):
+                    # ── Token received ────────────────────
+                    if not first_token_logged:
+                        first_token_logged = True
+                        logger.debug(
+                            "[CHAT] First token received at %.0f ms",
+                            (time.perf_counter() - t_start) * 1000,
+                        )
+                    token_count += 1
                     yield f"data: {json.dumps({'token': chunk})}\n\n"
+
                 else:
-                    # Final ChainResponse
+                    # ── Final ChainResponse ───────────────
                     is_document = chunk.query_type == "document"
                     citations   = []
                     image_urls  = []
@@ -195,11 +289,10 @@ async def chat_stream(req: ChatRequest):
                                 "heading"     : c.get("heading", ""),
                                 "section_path": c.get("section_path", ""),
                                 "chunk_type"  : c.get("type", "text"),
-                                # ── NEW: bbox + source_url for clickable citations ──
-                                "bbox"        : c.get("bbox"),          # [x0,y0,x1,y1] or null
-                                "page_width"  : c.get("page_width"),    # float or null
-                                "page_height" : c.get("page_height"),   # float or null
-                                "source_url"  : c.get("source_url", ""),# Supabase URL or ""
+                                "bbox"        : c.get("bbox"),
+                                "page_width"  : c.get("page_width"),
+                                "page_height" : c.get("page_height"),
+                                "source_url"  : c.get("source_url", ""),
                             }
                             for c in chunk.get_citations()
                         ]
@@ -208,9 +301,66 @@ async def chat_stream(req: ChatRequest):
                             for p in chunk.get_images()
                         ]
 
+                    # ── ONLINE RETRIEVAL CHUNKS LOG (INFO level for comparison) ──
+                    retrieval_chunks = chunk.retrieval.get_chunks()
+                    logger.info(
+                        "[CHAT/ONLINE] Final retrieval chunks passed to LLM: %d chunks",
+                        len(retrieval_chunks)
+                    )
+
+                    # ── SEMANTIC SEARCH ONLY LOG ──────────────────
+                    # Access raw retrieval before rerank from chain
+                    import services.rag_service as _rs
+                    chain2 = _rs.get_chain()
+                    q_vec = chain2.retriever.embedder.embed_text(req.question)
+                    logger.info(
+                        "[CHAT/ONLINE/SEMANTIC] Query embedding first 10: %s",
+                        q_vec[:10]
+                    )
+                    logger.info(
+                        "[CHAT/ONLINE/SEMANTIC] Query embedding norm: %.4f",
+                        sum(v*v for v in q_vec) ** 0.5
+                    )
+                    # Log the raw dense results from rag_chain._retrieve
+                    # These are already logged at INFO as [RAG CHAIN] RAW[...]
+                    # ──────────────────────────────────────────────────
+
+                    for i, rc in enumerate(retrieval_chunks):
+                        logger.info(
+                            "[CHAT/ONLINE] chunk[%d] src=%s p=%s score=%.4f parent_id=%s content_preview=%r",
+                            i,
+                            rc.get("source", "?"),
+                            rc.get("page", "?"),
+                            rc.get("rerank_score", rc.get("score", 0.0)),
+                            rc.get("parent_id", "")[:12],
+                            rc.get("content", "")[:80].replace("\n", " "),
+                        )
+                    # ────────────────────────────────────────────────────────────
+
+                    elapsed = (time.perf_counter() - t_start) * 1000
+                    logger.info(
+                        "[CHAT] ✅ ONLINE stream complete — "
+                        "query_type=%s  citations=%d  images=%d  "
+                        "tokens_streamed=%d  total=%.0f ms  "
+                        "usage(prompt=%d  completion=%d  total=%d)",
+                        chunk.query_type,
+                        len(citations),
+                        len(image_urls),
+                        token_count,
+                        elapsed,
+                        chunk.usage.get("prompt_tokens",     0),
+                        chunk.usage.get("completion_tokens", 0),
+                        chunk.usage.get("total_tokens",      0),
+                    )
+
                     yield f"data: {json.dumps({'done': True, 'citations': citations, 'image_urls': image_urls, 'query_type': chunk.query_type, 'usage': chunk.usage})}\n\n"
 
         except Exception as e:
+            elapsed = (time.perf_counter() - t_start) * 1000
+            logger.error(
+                "[CHAT] ❌ SSE stream error after %.0f ms: %s",
+                elapsed, e, exc_info=True,
+            )
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -236,10 +386,18 @@ async def chat_offline(req: ChatRequest):
     """
     chain        = rag_service.get_chain()
     active_store = rag_service.get_local_store()
+    has_kb       = active_store.count() > 0
 
-    has_kb = active_store.count() > 0
+    logger.info(
+        "[CHAT/OFFLINE] /chat/offline (Mode 2) — has_kb=%s  store=%s(%d)  question_len=%d",
+        has_kb,
+        type(active_store).__name__,
+        active_store.count(),
+        len(req.question),
+    )
 
     if not has_kb:
+        logger.warning("[CHAT/OFFLINE] Mode 2 — no KB documents, returning empty response")
         result = OfflineQueryResponse(
             query      = req.question,
             chunks     = [],
@@ -248,8 +406,14 @@ async def chat_offline(req: ChatRequest):
         )
         return JSONResponse(content=result.model_dump())
 
+    t0 = time.perf_counter()
     final_chunks = _run_offline_retrieval(req.question, chain, active_store)
     result       = _build_offline_response(req.question, final_chunks)
+    elapsed = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "[CHAT/OFFLINE] ✅ Mode 2 response ready — %d chunks  %.0f ms",
+        result.total, elapsed,
+    )
     return JSONResponse(content=result.model_dump())
 
 
@@ -257,7 +421,9 @@ async def chat_offline(req: ChatRequest):
 
 @router.post("/session/clear")
 async def clear_session(req: ClearRequest):
+    logger.info("[CHAT] Session clear requested")
     rag_service.clear_chain_memory()
+    logger.info("[CHAT] ✅ Conversation history cleared")
     return {"status": "ok"}
 
 
@@ -269,7 +435,16 @@ async def pin_source(req: PinRequest):
     chain   = rag_service.get_chain()
     sources = rag_service.get_vector_store().list_sources()
 
+    logger.info(
+        "[CHAT] Pin request — filename='%s'  available_sources=%d",
+        req.filename, len(sources),
+    )
+
     if req.filename not in sources:
+        logger.warning(
+            "[CHAT] Pin failed — '%s' not found in knowledge base (available: %s)",
+            req.filename, sources,
+        )
         from fastapi import HTTPException, status
         raise HTTPException(
             status_code = status.HTTP_404_NOT_FOUND,
@@ -277,17 +452,22 @@ async def pin_source(req: PinRequest):
         )
 
     chain.set_source_filter(req.filename)
+    logger.info("[CHAT] ✅ Pinned to source: '%s'", req.filename)
     return {"status": "ok", "pinned": req.filename}
 
 
 @router.delete("/session/pin")
 async def unpin_source():
     """Remove the source pin."""
+    logger.info("[CHAT] Unpin requested — removing source filter")
     rag_service.get_chain().clear_source_filter()
+    logger.info("[CHAT] ✅ Source pin cleared")
     return {"status": "ok", "pinned": None}
 
 
 @router.get("/session/pin")
 async def get_pin():
     """Return the currently pinned filename, or null."""
-    return {"pinned": rag_service.get_chain().get_source_filter()}
+    pinned = rag_service.get_chain().get_source_filter()
+    logger.debug("[CHAT] Current pin: %s", pinned or "none")
+    return {"pinned": pinned}

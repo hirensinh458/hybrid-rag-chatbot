@@ -47,7 +47,23 @@
 #     The batch count increases (e.g. 512 vectors → 21 cloud batches vs 6 local)
 #     but each request is small and fast, which is more reliable than one
 #     large slow request that risks timing out mid-write.
+#
+# FIX — get_vectors_for_export returned 0 matches:
+#   PROBLEM:
+#     Qdrant point IDs are random UUIDs (uuid4()) assigned at ingest time.
+#     The /kb/export endpoint builds chunk_id from BM25 chunk dicts using
+#     c.get("id") or f"{source}_{page}_{i}" — never a UUID.
+#     So id_to_vec.get(chunk_id) always returned None → 0 vectors on mobile.
+#
+#   FIX:
+#     Introduce _content_hash(source, page, content) — a stable MD5 key derived
+#     from fields present in BOTH BM25 chunks and Qdrant payloads.
+#     get_vectors_for_export() now scrolls with_payload=["source","page","content"]
+#     and keys by this hash. The /kb/export endpoint builds the SAME hash for
+#     each BM25 chunk so the lookup always hits.
+#     _content_hash is exported at module level so kb.py can import it directly.
 
+import hashlib
 import os
 import sys
 import uuid
@@ -82,6 +98,26 @@ _CLOUD_UPSERT_BATCH  = 25
 # 60s is conservative; most batches complete in < 5s, but slow connections
 # or large payloads can be slow. Better to wait than to crash mid-ingest.
 _CLOUD_HTTP_TIMEOUT  = 60
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE-LEVEL HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _content_hash(source: str, page: int, content: str) -> str:
+    """
+    Stable lookup key shared between get_vectors_for_export() and /kb/export.
+
+    WHY: Qdrant point IDs are random UUIDs — BM25 chunks have no knowledge
+    of them. We need a key derivable from fields present in BOTH stores.
+    source + page + first 80 chars of content is unique for any realistic
+    chunk set and cheap to compute on both sides.
+
+    Exported at module level so kb.py can import and use the same function,
+    guaranteeing the keys always match without duplication.
+    """
+    key = f"{source}|{page}|{content[:80]}"
+    return hashlib.md5(key.encode()).hexdigest()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,7 +205,6 @@ class QdrantVectorStore(BaseVectorStore):
             )
             print(f"  [QDRANT] Created new collection: '{self.collection}'")
 
-            # ── THIS IS THE FIX ─────────────────────────────────────
             self.client.create_payload_index(
                 collection_name = self.collection,
                 field_name      = "source",
@@ -500,5 +535,81 @@ class QdrantVectorStore(BaseVectorStore):
         self.client.delete_collection(self.collection)
         print(f"  [QDRANT] Deleted collection: '{self.collection}'")
 
+    # ── MOBILE EXPORT HELPERS ─────────────────────────────────────────────
 
-__all__ = ["QdrantVectorStore"]
+    def get_vectors_for_export(self) -> dict[str, list[float]]:
+        id_to_vec: dict[str, list[float]] = {}
+        _sample_logged = False  # log only a few examples to avoid log spam
+
+        try:
+            offset = None
+            while True:
+                results, next_offset = self.client.scroll(
+                    collection_name=self.collection,
+                    limit=500,
+                    offset=offset,
+                    with_vectors=True,
+                    with_payload=["source", "page", "content"],
+                )
+                for point in results:
+                    if point.vector is None:
+                        continue
+                    payload = point.payload or {}
+
+                    raw_source  = payload.get("source",  "")
+                    raw_page    = payload.get("page",    0)
+                    raw_content = payload.get("content", "")
+
+                    # ── DEEP DEBUG ────────────────────────────────────────────
+                    if not _sample_logged:
+                        _sample_logged = True
+                        print(f"\n  [DEBUG/qdrant] === FIRST POINT PAYLOAD SAMPLE ===")
+                        print(f"  [DEBUG/qdrant] source type={type(raw_source).__name__!r}  repr={repr(raw_source)}")
+                        print(f"  [DEBUG/qdrant] page   type={type(raw_page).__name__!r}  value={raw_page!r}")
+                        print(f"  [DEBUG/qdrant] content type={type(raw_content).__name__!r}  first 120 chars repr:")
+                        print(f"  [DEBUG/qdrant]   {repr(raw_content[:120])}")
+                        print(f"  [DEBUG/qdrant] content[:80] repr for hash: {repr(raw_content[:80])}")
+                        _key = f"{raw_source}|{raw_page}|{raw_content[:80]}"
+                        print(f"  [DEBUG/qdrant] hash input repr: {repr(_key)}")
+                        print(f"  [DEBUG/qdrant] resulting hash : {hashlib.md5(_key.encode()).hexdigest()}")
+                        print(f"  [DEBUG/qdrant] ==========================================\n")
+                    # ── END DEEP DEBUG ────────────────────────────────────────
+
+                    hash_key = _content_hash(
+                        source=raw_source,
+                        page=raw_page,
+                        content=raw_content,
+                    )
+                    id_to_vec[hash_key] = point.vector
+
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+        except Exception as e:
+            print(f"  [QDRANT] get_vectors_for_export failed: {e}")
+
+        print(f"  [QDRANT] get_vectors_for_export: {len(id_to_vec)} vectors ready")
+        return id_to_vec
+
+    def get_export_etag(self) -> str:
+        """
+        MD5 hash of sorted point IDs — changes whenever any doc is added or deleted.
+
+        Returned in the X-Export-Etag header by /kb/export.
+        The mobile app sends this back in If-None-Match on the next poll.
+        If it matches, the server returns 304 and the app skips the DB write.
+
+        This is cheap: we only need IDs, not vectors or payload.
+        """
+        try:
+            # get_all_ids() returns list of {"id": ...} dicts — extract the id values
+            ids = self.get_all_ids()
+            return hashlib.md5(
+                ','.join(sorted(str(i["id"]) for i in ids)).encode()
+            ).hexdigest()
+        except Exception:
+            return ""
+
+
+__all__ = ["QdrantVectorStore", "_content_hash"]
