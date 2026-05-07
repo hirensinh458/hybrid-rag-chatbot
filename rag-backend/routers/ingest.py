@@ -1,39 +1,4 @@
 # rag-backend/routers/ingest.py
-#
-# SYNC FIX — Re-upload / overwrite of same-named PDF now always re-indexes:
-#
-#   ROOT CAUSE:
-#     The SHA-256 hash registry (file_hashes.json) maps sha256 → filename.
-#     When an admin uploads a PDF whose content bytes are identical to a
-#     previously indexed version (common when re-uploading after a failed sync
-#     or when testing), `fhash in hashes` was True and the file was silently
-#     skipped as a "duplicate" — even though the admin explicitly chose to
-#     upload it again.
-#
-#     More critically, when an admin:
-#       1. Uploads PDF v1 (indexed, hash H1 stored)
-#       2. Modifies the PDF and uploads v2 (different bytes, hash H2, indexed OK)
-#       3. Wants to re-upload v1 (same bytes as step 1, hash H1 still in registry)
-#     Step 3 was silently skipped. The app never got the updated KB.
-#
-#     The hash registry's purpose is to prevent duplicate ingestion of the
-#     SAME file uploaded TWICE IN THE SAME BATCH (e.g. user drags two copies
-#     of the same file). It was never meant to block intentional re-uploads.
-#
-#   FIX:
-#     Before the duplicate check, if the incoming filename already exists in
-#     the knowledge base (Qdrant + BM25), delete it first. This is the same
-#     operation as a manual DELETE followed by a new ingest — but automatic.
-#
-#     Additionally remove any old hash registry entries for this filename
-#     before the duplicate check, so the same-content re-upload is always
-#     treated as fresh.
-#
-#     The net effect: uploading a PDF always indexes it, whether the content
-#     changed or not. The only "skip" that remains is when the SAME file
-#     appears TWICE in the SAME upload batch (truly accidental duplicate).
-#
-# ALL OTHER LOGIC IS UNCHANGED.
 
 import hashlib
 import json
@@ -47,9 +12,11 @@ from fastapi.concurrency import run_in_threadpool
 
 from config import settings, PDFS_DIR
 from services import rag_service as _svc
-from ingestion.pdf_loader  import PDFLoader
+from ingestion.pdf_loader import PDFLoader
 from schemas import DeleteFileResponse, IngestResponse, IngestStatusResponse
 from services import rag_service
+
+# NO import from routers.kb here — use local imports inside functions instead
 
 router = APIRouter(tags=["ingest"])
 
@@ -57,7 +24,7 @@ router = APIRouter(tags=["ingest"])
 _HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
 
 # ── PDFs directory ────────────────────────────────────────────
-_PDFS_DIR  = Path(PDFS_DIR)
+_PDFS_DIR = Path(PDFS_DIR)
 
 
 def _load_hashes() -> dict:
@@ -277,7 +244,6 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest(files: list[UploadFile] = File(...)):
-    # Save original PDFs for the viewer before processing
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for file in files:
@@ -293,7 +259,7 @@ async def ingest(files: list[UploadFile] = File(...)):
 
     tmp_dir    = Path("/tmp") / f"rag_ingest_{uuid.uuid4().hex}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    file_paths : list[tuple[str, str]] = []
+    file_paths: list[tuple[str, str]] = []
 
     try:
         for upload in files:
@@ -306,6 +272,11 @@ async def ingest(files: list[UploadFile] = File(...)):
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Local import — avoids circular dependency with kb.py
+    from routers.kb import _vec_cache, _source_hash_cache
+    _vec_cache.clear()
+    _source_hash_cache.clear()
 
     return IngestResponse(
         status        = "ok",
@@ -368,6 +339,11 @@ async def delete_file(filename: str):
 
     _remove_hash_for_file(filename)
     _delete_pdf_file(filename)
+
+    # Local import — avoids circular dependency with kb.py
+    from routers.kb import _vec_cache, _source_hash_cache
+    _vec_cache.clear()
+    _source_hash_cache.clear()
 
     return DeleteFileResponse(
         status          = "ok",
