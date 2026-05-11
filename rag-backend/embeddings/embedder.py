@@ -117,7 +117,7 @@ class HuggingFaceEmbedder(BaseEmbedder):
         print(f"  [EMBEDDER] Embedding {len(texts)} chunks...")
         vectors = self._model.encode(
             texts,
-            batch_size           = 32,
+            batch_size           = 64,
             show_progress_bar    = len(texts) > 50,
             convert_to_numpy     = True,
             normalize_embeddings = True,

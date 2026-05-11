@@ -22,6 +22,9 @@
 #   Also carries forward the BM25 rebuild fix:
 #     new_bm25.build(chunks) not new_bm25.index_chunks(chunks)
 #
+#   FIXED: rebuild_bm25_async() now copies the full payload (including "page")
+#          so that hash matching between BM25 and Qdrant works.
+#
 # All other code is UNCHANGED from the original.
 
 import threading
@@ -284,6 +287,7 @@ def rebuild_bm25_async() -> None:
     """
     Rebuild BM25 from local store contents after a vector sync.
     FIX: uses new_bm25.build() — index_chunks() is on HybridRetriever, not BM25Store.
+    FIXED: Preserves full payload (including 'page') to keep hash compatibility with Qdrant.
     """
     def _rebuild():
         global _bm25_store
@@ -295,11 +299,9 @@ def rebuild_bm25_async() -> None:
                 return
 
             all_points = _local_store.get_points_by_ids([p["id"] for p in all_ids])
+            # 🔧 FIX: Copy the full payload instead of only content+source
             chunks = [
-                {
-                    "content": pt["payload"].get("content", ""),
-                    "source" : pt["payload"].get("source", ""),
-                }
+                {**pt["payload"]}  # includes "page", "source", "content", etc.
                 for pt in all_points
                 if pt["payload"].get("content")
             ]
