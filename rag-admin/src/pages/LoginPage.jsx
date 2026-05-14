@@ -1,9 +1,10 @@
 // src/pages/LoginPage.jsx
 // Email + password login using Supabase Auth.
-// After login, AuthContext.onAuthStateChange fires → app redirects to dashboard.
+// After login, AuthContext.onAuthStateChange fires → AuthRedirect in App.jsx
+// handles navigation based on tenant/onboarding state. No manual navigate here.
 
 import { useState } from 'react'
-import { Link, useNavigate, useLocation } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
 function Logo() {
@@ -18,23 +19,22 @@ function Logo() {
 }
 
 export default function LoginPage() {
-  const { login } = useAuth()
-  const navigate   = useNavigate()
-  const location   = useLocation()
-  const from       = location.state?.from?.pathname ?? '/'
+  const { login, isAuthenticated } = useAuth()
 
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
   const [error,    setError]    = useState('')
   const [loading,  setLoading]  = useState(false)
 
+  // If already authenticated, AuthRedirect will handle navigation — nothing to do here
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
     setLoading(true)
     try {
       await login(email.trim(), password)
-      navigate(from, { replace: true })
+      // No navigate() here — AuthRedirect watches onAuthStateChange and
+      // redirects to /plans, /onboarding, or / based on tenant state
     } catch (err) {
       setError(err.message)
     } finally {

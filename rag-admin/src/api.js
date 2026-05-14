@@ -171,3 +171,11 @@ export async function triggerSync() {
   if (!res.ok) throw new Error('Sync trigger failed')
   return res.json()
 }
+
+export async function adminCompleteOnboarding() {
+  const res = await fetch(`${BASE}/onboarding-complete`, {
+    method: 'POST',
+    headers: await getAuthHeaders(),
+  })
+  return handleResponse(res)
+}

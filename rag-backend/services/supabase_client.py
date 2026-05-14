@@ -24,23 +24,15 @@ from functools import lru_cache
 
 @lru_cache(maxsize=1)
 def get_supabase_admin():
-    """
-    Return a cached Supabase client initialised with the service_role key.
-
-    The client is constructed once per process lifetime (lru_cache maxsize=1).
-    Thread-safe because lru_cache is thread-safe in CPython.
-
-    Returns:
-        supabase.Client — authenticated as service_role (bypasses RLS).
-
-    Raises:
-        RuntimeError — if SUPABASE_URL or SUPABASE_SERVICE_KEY are not set.
-    """
     from config import settings
-    from supabase import create_client, Client  # pip install supabase
+    from supabase import create_client, Client
 
     url = settings.supabase_url.strip()
     key = settings.supabase_service_key.strip()
+
+    print(f"  [SUPABASE_DEBUG] url  = {repr(url)}")
+    print(f"  [SUPABASE_DEBUG] key  = {repr(key[:30]) if key else 'EMPTY'}")
+    print(f"  [SUPABASE_DEBUG] key length = {len(key)}")
 
     if not url or not key:
         raise RuntimeError(
@@ -49,7 +41,6 @@ def get_supabase_admin():
         )
 
     client: Client = create_client(url, key)
-    print(f"  [SUPABASE_CLIENT] ✅ Admin client initialised for {url}")
     return client
 
 

@@ -1,11 +1,12 @@
 // src/pages/SignupPage.jsx
 //
-// Three-step admin signup flow:
-//   Step 1: Email + Password + Company Name → POST /auth/admin/signup
-//   Step 2: Redirect to /verify — "Check your email"
-//   Step 3: Email link clicks → Supabase handles → redirect to /plans
+// Admin signup: Company Name + Email + Password → POST /auth/admin/signup
 //
-// The backend /auth/admin/signup creates the Supabase user + tenant row.
+// Two outcomes after submit:
+//   A) Email confirmation OFF in Supabase → signup() signs in automatically
+//      → session set → AuthRedirect sends user to /plans
+//   B) Email confirmation ON → signInWithPassword fails with "Email not confirmed"
+//      → we catch it and navigate to /verify manually
 
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
@@ -27,12 +28,12 @@ export default function SignupPage() {
   const { signup } = useAuth()
   const navigate = useNavigate()
 
-  const [email,       setEmail]       = useState('')
-  const [password,    setPassword]    = useState('')
-  const [company,     setCompany]     = useState('')
-  const [error,       setError]       = useState('')
-  const [loading,     setLoading]     = useState(false)
-  const [pwStrength,  setPwStrength]  = useState(0)   // 0-3 visual indicator
+  const [email,      setEmail]      = useState('')
+  const [password,   setPassword]   = useState('')
+  const [company,    setCompany]    = useState('')
+  const [error,      setError]      = useState('')
+  const [loading,    setLoading]    = useState(false)
+  const [pwStrength, setPwStrength] = useState(0)
 
   const checkStrength = (pw) => {
     let s = 0
@@ -46,27 +47,19 @@ export default function SignupPage() {
     e.preventDefault()
     setError('')
 
-    if (password.length < 8) {
-      setError('Password must be at least 8 characters.')
-      return
-    }
-    if (!company.trim()) {
-      setError('Company name is required.')
-      return
-    }
+    if (password.length < 8) { setError('Password must be at least 8 characters.'); return }
+    if (!company.trim())     { setError('Company name is required.'); return }
 
     setLoading(true)
     try {
       await signup(email.trim(), password, company.trim())
-      // signup() sets the Supabase session internally.
-      // Navigate to plan selection — the user is now authenticated.
-      navigate('/plans', { replace: true })
+      // signup() internally calls signInWithPassword after backend creates the user.
+      // If email confirmation is OFF → session is set → AuthRedirect handles navigation.
+      // If email confirmation is ON  → signInWithPassword throws → caught below.
     } catch (err) {
-      // Supabase email confirmation is enabled → backend returns success,
-      // but session isn't set yet. In that case, go to verify page.
-      if (err.message?.toLowerCase().includes('confirm') ||
-          err.message?.toLowerCase().includes('verify') ||
-          err.message?.toLowerCase().includes('email')) {
+      const msg = err.message?.toLowerCase() ?? ''
+      // Supabase throws "Email not confirmed" when confirmation is required
+      if (msg.includes('not confirmed') || msg.includes('confirm') || msg.includes('verify')) {
         navigate('/verify', { replace: true })
       } else {
         setError(err.message)
@@ -141,7 +134,6 @@ export default function SignupPage() {
               required
               style={inputStyle}
             />
-            {/* Password strength bar */}
             {password && (
               <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
                 {[0, 1, 2].map(i => (

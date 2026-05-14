@@ -92,23 +92,21 @@ export function AuthProvider({ children }) {
   }
 
   const signup = async (email, password, companyName) => {
-    // Call backend /auth/admin/signup so the backend can create the tenant row
-    // and immediately sign them in.  We pass company_name so the backend can
-    // set display_name on the tenant.
-    const res = await fetch('/auth/admin/signup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, company_name: companyName }),
-    })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.detail?.message ?? err.detail ?? 'Signup failed')
-    }
-    const { access_token, refresh_token } = await res.json()
-    // Hydrate the Supabase client with the returned session
-    const { error } = await supabase.auth.setSession({ access_token, refresh_token })
-    if (error) throw new Error(error.message)
+  const res = await fetch('/auth/admin/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password, company_name: companyName }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail?.message ?? err.detail ?? 'Signup failed')
   }
+
+  // Backend created the user + tenant. Now sign in to get a real session.
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+  if (error) throw new Error(error.message)
+  return data
+}
 
   const logout = async () => {
     await supabase.auth.signOut()

@@ -1,15 +1,15 @@
 // src/App.jsx
 // Router shell only — no UI here.
-// All page content lives in src/pages/*.
 //
-// Route guards:
-//   ProtectedRoute — redirects to /login if no session.
-//   After first successful login checks isOnboardingComplete():
-//     false → redirects to /onboarding (shown once per new tenant admin)
-//     true  → renders the requested page normally
+// Routing logic:
+//   - No session              → /login or /signup or /verify (public routes)
+//   - Session, no tenant      → /plans  (new user, pick a plan)
+//   - Session, not onboarded  → /onboarding
+//   - Session, onboarded      → dashboard (/)
 
-import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
-import { useAuth } from './context/AuthContext'
+import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { useEffect }        from 'react'
+import { useAuth }          from './context/AuthContext'
 
 import LoginPage         from './pages/LoginPage'
 import SignupPage        from './pages/SignupPage'
@@ -18,7 +18,7 @@ import PlanSelectionPage from './pages/PlanSelectionPage'
 import OnboardingPage    from './pages/OnboardingPage'
 import DashboardPage     from './pages/DashboardPage'
 
-// ── Spinner shown during initial session restore ───────────────────────────────
+// ── Spinner ────────────────────────────────────────────────────────────────────
 function SplashScreen() {
   return (
     <div style={{
@@ -39,19 +39,50 @@ function SplashScreen() {
   )
 }
 
+// ── Auth-driven redirect component ────────────────────────────────────────────
+// Mounted on every protected route. Watches auth state and redirects
+// reactively so navigation always reflects the current session state.
+function AuthRedirect() {
+  const { isAuthenticated, isOnboardingComplete, loading, tenant } = useAuth()
+  const navigate  = useNavigate()
+  const location  = useLocation()
+
+  useEffect(() => {
+    if (loading) return
+
+    const path = location.pathname
+
+    // Public paths — don't interfere
+    if (['/login', '/signup', '/verify', '/plans'].includes(path)) return
+
+    if (!isAuthenticated) {
+      navigate('/login', { replace: true })
+      return
+    }
+
+    // Authenticated but no tenant yet (just confirmed email, no plan chosen)
+    if (!tenant?.slug && path !== '/plans') {
+      navigate('/plans', { replace: true })
+      return
+    }
+
+    // Authenticated + tenant, but onboarding not done
+    if (tenant?.slug && !isOnboardingComplete() && path !== '/onboarding') {
+      navigate('/onboarding', { replace: true })
+      return
+    }
+  }, [isAuthenticated, isOnboardingComplete, loading, tenant, location.pathname, navigate])
+
+  return null
+}
+
 // ── Protected route wrapper ────────────────────────────────────────────────────
 function ProtectedRoute({ children }) {
-  const { isAuthenticated, isOnboardingComplete, loading } = useAuth()
+  const { isAuthenticated, loading } = useAuth()
   const location = useLocation()
 
   if (loading) return <SplashScreen />
   if (!isAuthenticated) return <Navigate to="/login" state={{ from: location }} replace />
-
-  // Skip onboarding redirect if we're already going there
-  if (!isOnboardingComplete() && location.pathname !== '/onboarding') {
-    return <Navigate to="/onboarding" replace />
-  }
-
   return children
 }
 
@@ -62,30 +93,35 @@ export default function App() {
   if (loading) return <SplashScreen />
 
   return (
-    <Routes>
-      {/* Public */}
-      <Route path="/login"  element={<LoginPage />} />
-      <Route path="/signup" element={<SignupPage />} />
-      <Route path="/verify" element={<VerifyEmailPage />} />
-      <Route path="/plans"  element={<PlanSelectionPage />} />
+    <>
+      {/* AuthRedirect watches state changes and navigates reactively */}
+      <AuthRedirect />
 
-      {/* Protected */}
-      <Route
-        path="/onboarding"
-        element={
-          <ProtectedRoute>
-            <OnboardingPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/*"
-        element={
-          <ProtectedRoute>
-            <DashboardPage />
-          </ProtectedRoute>
-        }
-      />
-    </Routes>
+      <Routes>
+        {/* Public */}
+        <Route path="/login"  element={<LoginPage />} />
+        <Route path="/signup" element={<SignupPage />} />
+        <Route path="/verify" element={<VerifyEmailPage />} />
+        <Route path="/plans"  element={<PlanSelectionPage />} />
+
+        {/* Protected */}
+        <Route
+          path="/onboarding"
+          element={
+            <ProtectedRoute>
+              <OnboardingPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/*"
+          element={
+            <ProtectedRoute>
+              <DashboardPage />
+            </ProtectedRoute>
+          }
+        />
+      </Routes>
+    </>
   )
 }

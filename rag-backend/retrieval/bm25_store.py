@@ -181,11 +181,11 @@ class BM25Store:
     # ── persistence ───────────────────────────────────────
 
     def _load(self) -> None:
-        if not Path(self.path).exists():
+        if not Path(self._path).exists():
             print("  [BM25] No saved index — will build on first ingest")
             return
         try:
-            with open(self.path, "rb") as f:
+            with open(self._path, "rb") as f:
                 data         = pickle.load(f)
             self._chunks = data.get("chunks", [])
             self._bm25   = data.get("bm25")
@@ -197,7 +197,7 @@ class BM25Store:
 
     def _save(self) -> None:
         try:
-            with open(self.path, "wb") as f:
+            with open(self._path, "wb") as f:
                 pickle.dump({"chunks": self._chunks, "bm25": self._bm25}, f)
         except Exception as e:
             print(f"  [BM25] Save failed: {e}")
@@ -258,8 +258,8 @@ class BM25Store:
         """Wipe the entire index from memory and disk."""
         self._chunks = []
         self._bm25   = None
-        if Path(self.path).exists():
-            Path(self.path).unlink()
+        if Path(self._path).exists():
+            Path(self._path).unlink()
         print("  [BM25] Index reset")
 
     # ── read ──────────────────────────────────────────────

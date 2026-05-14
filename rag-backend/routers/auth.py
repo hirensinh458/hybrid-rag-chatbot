@@ -177,7 +177,7 @@ async def admin_signup(body: AdminSignupRequest):
             {
                 "email"        : body.email,
                 "password"     : body.password,
-                "email_confirm": False,   # Supabase sends verification email
+                "email_confirm": True,   # Supabase sends verification email
             }
         )
         user = getattr(auth_response, "user", None)
