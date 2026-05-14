@@ -1,22 +1,32 @@
 # routers/admin.py
 #
-# Phase 2 — Authentication System
+# Phase 4 — Backend: Admin API (Document Management + Stats)
 #
-# CHANGES vs previous version:
-#   - Auth:  Replaced static ADMIN_TOKEN dependency (require_admin) with
-#            Supabase JWT-based auth (resolve_tenant + require_admin_role).
-#   - Stores: All vector store / BM25 calls now use get_tenant_stores()
-#             scoped to request.state.tenant_slug instead of global singletons.
-#   - NEW endpoints:
-#       GET  /admin/join-code             — return current join code
-#       POST /admin/join-code/regenerate  — rotate join code (old one invalid)
-#   - All existing routes (ingest, delete, wipe, files, stats) are unchanged
-#     in behaviour — only the auth layer and store scope have changed.
+# CHANGES vs Phase 3 version:
+#   NEW endpoints:
+#     GET    /admin/documents               — list documents from `documents` DB table
+#     DELETE /admin/documents/{doc_id}      — full delete by UUID: vectors + BM25 +
+#                                             Supabase Storage + DB row + usage decrement
+#     GET    /admin/usage                   — plan usage stats with limits and percentages
 #
-# Auth:
-#   All routes require a valid Supabase JWT with role == 'admin' or 'super_admin'.
-#   Obtain a JWT via POST /auth/admin/login.
-#   Include in every request: Authorization: Bearer <access_token>
+# All Phase 2/3 endpoints are UNCHANGED:
+#     GET    /admin/join-code
+#     POST   /admin/join-code/regenerate
+#     POST   /admin/ingest
+#     DELETE /admin/file/{filename}
+#     DELETE /admin/collection
+#     GET    /admin/files
+#     GET    /admin/stats
+#
+# Why two delete endpoints?
+#   DELETE /admin/file/{filename}   — legacy; uses filename directly from Qdrant
+#                                     sources; requires cloud store to be configured.
+#   DELETE /admin/documents/{doc_id} — Phase 4; uses doc UUID from the `documents`
+#                                       table; works without cloud store; correct
+#                                       usage accounting via chunk_count from DB.
+#
+# Auth: all routes require a valid Supabase JWT with role == 'admin' | 'super_admin'.
+# Obtain via POST /auth/admin/login.
 
 import random
 import shutil
@@ -31,6 +41,7 @@ from middleware.tenant_resolver import require_admin_role, resolve_tenant
 from services                  import rag_service
 from services.rag_service      import get_tenant_stores
 from services.supabase_client  import get_supabase_admin
+from services.plan_service     import PlanService
 from schemas                   import IngestResponse, DeleteFileResponse, WipeResponse
 from config                    import settings
 from utils.logger              import get_logger
@@ -159,6 +170,345 @@ async def regenerate_join_code(request: Request):
     }
 
 
+# ── GET /admin/documents ──────────────────────────────────────────────────────
+#
+# Phase 4: Returns rows from the `documents` metadata table for this tenant.
+# Richer than GET /admin/files which only returns filenames from Qdrant sources.
+# Includes chunk_count, file_size, ingestion status, and storage path — enough
+# for the admin dashboard to render a full document management table.
+
+@router.get("/documents")
+async def admin_list_documents(request: Request):
+    """
+    List all ingested documents for this tenant from the metadata DB.
+
+    Returns full document records (id, filename, chunk_count, file_size,
+    status, ingested_at, storage_path) — not just filenames.
+
+    Use DELETE /admin/documents/{doc_id} to remove a document by its UUID.
+    Use GET /admin/files to get a simple filename list from the vector store.
+
+    Response shape:
+        {
+          "documents": [
+            {
+              "id"          : "uuid",
+              "filename"    : "engine_manual.pdf",
+              "chunk_count" : 142,
+              "file_size"   : 2048576,     // bytes, null if unknown
+              "status"      : "success",   // success | failed | partial
+              "ingested_at" : "2025-01-15T10:30:00Z",
+              "storage_path": "pdfs/acme_shipping/engine_manual.pdf"
+            }, ...
+          ],
+          "total": 3
+        }
+    """
+    tenant_id = request.state.tenant_id
+    sb        = get_supabase_admin()
+
+    result = (
+        sb.table("documents")
+        .select("id, filename, chunk_count, file_size, status, ingested_at, storage_path")
+        .eq("tenant_id", tenant_id)
+        .order("ingested_at", desc=True)
+        .execute()
+    )
+
+    docs = result.data or []
+
+    logger.debug(
+        "[ADMIN/DOCUMENTS] tenant=%s  count=%d",
+        request.state.tenant_slug, len(docs),
+    )
+    return {
+        "documents": docs,
+        "total"    : len(docs),
+    }
+
+
+# ── DELETE /admin/documents/{doc_id} ─────────────────────────────────────────
+#
+# Phase 4: Delete a document by its UUID from the `documents` table.
+# This is the canonical delete endpoint for the admin dashboard.
+# Performs a complete cleanup: vectors → BM25 → Supabase Storage → local PDF
+# → documents DB row → usage decrement.
+#
+# Contrast with DELETE /admin/file/{filename}: that endpoint requires cloud
+# store to be configured and uses filename directly from Qdrant. This endpoint
+# works with local-only deployments and correctly accounts for usage via
+# the chunk_count stored in the documents table.
+
+@router.delete("/documents/{doc_id}")
+async def admin_delete_document(request: Request, doc_id: str):
+    """
+    Fully delete a document by its UUID (from the documents metadata table).
+
+    Performs these steps in order:
+      1. Fetch document row — verify it belongs to this tenant (security check).
+      2. Delete vectors from tenant Qdrant collection.
+      3. Delete BM25 index entries for this file.
+      4. Delete PDF from Supabase Storage (scoped path: pdfs/{slug}/{filename}).
+      5. Delete local PDF from data/pdfs/ viewer store.
+      6. Remove SHA-256 hash record (allows re-ingestion of the same file later).
+      7. Delete row from `documents` table.
+      8. Decrement tenant_usage.vector_count by doc.chunk_count.
+
+    Returns:
+        { "deleted": true, "filename": "...", "vectors_freed": N, "doc_id": "..." }
+    """
+    tenant_id   = request.state.tenant_id
+    tenant_slug = request.state.tenant_slug
+    sb          = get_supabase_admin()
+
+    # ── 1. Fetch document row — verify ownership ──────────────────────────────
+    doc_result = (
+        sb.table("documents")
+        .select("id, filename, chunk_count, file_size, status, storage_path")
+        .eq("id", doc_id)
+        .eq("tenant_id", tenant_id)   # SECURITY: scope to this tenant only
+        .single()
+        .execute()
+    )
+
+    if not doc_result.data:
+        raise HTTPException(
+            status_code = status.HTTP_404_NOT_FOUND,
+            detail      = (
+                f"Document '{doc_id}' not found. "
+                "It may have already been deleted or belong to a different tenant."
+            ),
+        )
+
+    doc      = doc_result.data
+    filename = doc["filename"]
+    chunk_count = doc.get("chunk_count", 0)
+
+    logger.info(
+        "[ADMIN/DELETE-DOC] Starting delete — tenant=%s  doc_id=%s  file=%s  chunks=%d",
+        tenant_slug, doc_id, filename, chunk_count,
+    )
+
+    # ── 2. Delete vectors from tenant Qdrant collection ───────────────────────
+    vs, bm25 = get_tenant_stores(tenant_slug)
+
+    vectors_deleted = 0
+    try:
+        vectors_deleted = await run_in_threadpool(vs.delete_by_source, filename)
+        logger.info(
+            "[ADMIN/DELETE-DOC] Vectors deleted — tenant=%s  file=%s  count=%d",
+            tenant_slug, filename, vectors_deleted,
+        )
+    except Exception as exc:
+        logger.error(
+            "[ADMIN/DELETE-DOC] Vector delete failed — tenant=%s  file=%s: %s",
+            tenant_slug, filename, exc,
+        )
+        # Non-fatal: continue cleanup — partial state is correctable by reconciliation.
+
+    # ── 3. Delete BM25 entries ────────────────────────────────────────────────
+    try:
+        bm25_removed = bm25.delete_by_source(filename)
+        logger.info(
+            "[ADMIN/DELETE-DOC] BM25 entries removed — file=%s  count=%d",
+            filename, bm25_removed,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[ADMIN/DELETE-DOC] BM25 delete failed — file=%s: %s", filename, exc,
+        )
+
+    # ── 4. Delete from Supabase Storage (tenant-scoped path) ─────────────────
+    try:
+        from services.supabase_storage import delete_pdf_from_supabase
+        deleted_storage = delete_pdf_from_supabase(filename, tenant_slug=tenant_slug)
+        if deleted_storage:
+            logger.info(
+                "[ADMIN/DELETE-DOC] Supabase Storage deleted — path=pdfs/%s/%s",
+                tenant_slug, filename,
+            )
+        else:
+            logger.warning(
+                "[ADMIN/DELETE-DOC] Supabase Storage delete returned False — "
+                "path=pdfs/%s/%s (may not have existed or storage not configured)",
+                tenant_slug, filename,
+            )
+    except Exception as exc:
+        logger.warning(
+            "[ADMIN/DELETE-DOC] Supabase Storage delete exception — file=%s: %s",
+            filename, exc,
+        )
+
+    # ── 5. Delete local PDF from viewer store (data/pdfs/) ───────────────────
+    try:
+        _delete_pdf_file(filename)
+        logger.info("[ADMIN/DELETE-DOC] Local PDF removed — file=%s", filename)
+    except Exception as exc:
+        logger.warning(
+            "[ADMIN/DELETE-DOC] Local PDF delete failed — file=%s: %s", filename, exc,
+        )
+
+    # ── 6. Remove SHA-256 hash record (allows future re-ingestion) ───────────
+    try:
+        _remove_hash_for_file(filename)
+    except Exception as exc:
+        logger.warning(
+            "[ADMIN/DELETE-DOC] Hash removal failed — file=%s: %s", filename, exc,
+        )
+
+    # ── 7. Delete row from `documents` table ─────────────────────────────────
+    try:
+        sb.table("documents").delete().eq("id", doc_id).execute()
+        logger.info(
+            "[ADMIN/DELETE-DOC] documents row deleted — doc_id=%s", doc_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "[ADMIN/DELETE-DOC] documents row delete failed — doc_id=%s: %s",
+            doc_id, exc,
+        )
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail      = "Failed to remove document record. Please try again.",
+        )
+
+    # ── 8. Decrement tenant_usage.vector_count ────────────────────────────────
+    if chunk_count > 0:
+        try:
+            plan_svc = PlanService(sb)
+            await run_in_threadpool(plan_svc.decrement_vectors, tenant_id, chunk_count)
+            logger.info(
+                "[ADMIN/DELETE-DOC] Usage decremented — tenant=%s  -%d vectors",
+                tenant_slug, chunk_count,
+            )
+        except Exception as exc:
+            # Non-fatal: nightly reconciliation will correct any drift.
+            logger.error(
+                "[ADMIN/DELETE-DOC] Usage decrement failed — tenant=%s: %s",
+                tenant_slug, exc,
+            )
+
+    logger.info(
+        "[ADMIN/DELETE-DOC] ✅ Complete — tenant=%s  file=%s  "
+        "vectors_freed=%d  doc_id=%s",
+        tenant_slug, filename, vectors_deleted, doc_id,
+    )
+
+    return {
+        "deleted"      : True,
+        "doc_id"       : doc_id,
+        "filename"     : filename,
+        "vectors_freed": vectors_deleted,
+        "message"      : (
+            f"'{filename}' deleted. {vectors_deleted} vectors freed."
+        ),
+    }
+
+
+# ── GET /admin/usage ──────────────────────────────────────────────────────────
+#
+# Phase 4: Returns structured usage stats for this tenant, merged with plan
+# limits and expressed as percentages. Provides all the data an admin dashboard
+# needs to render usage meters.
+
+@router.get("/usage")
+async def admin_usage(request: Request):
+    """
+    Return plan usage stats for this tenant merged with plan limits.
+
+    The response includes raw counts, plan limits, and percentage utilisation
+    for both vectors and user seats. Also includes tenant status and plan name.
+
+    Response shape:
+        {
+          "vectors": {
+            "used"   : 15000,
+            "limit"  : 200000,
+            "percent": 7.5
+          },
+          "users": {
+            "used"   : 8,
+            "limit"  : 50,
+            "percent": 16.0
+          },
+          "status"         : "active",   // trial | active | over_quota | suspended
+          "plan"           : "Growth",
+          "plan_id"        : "uuid",
+          "trial_ends_at"  : "2025-02-01T00:00:00Z" | null,
+          "last_ingestion" : "2025-01-15T10:30:00Z" | null
+        }
+    """
+    tenant_id = request.state.tenant_id
+    sb        = get_supabase_admin()
+
+    # ── Fetch tenant (status, trial_ends_at) + plan (limits, name) ────────────
+    tenant_result = (
+        sb.table("tenants")
+        .select("status, trial_ends_at, plan_id, plans(id, name, max_vectors, max_users)")
+        .eq("id", tenant_id)
+        .single()
+        .execute()
+    )
+
+    if not tenant_result.data:
+        raise HTTPException(
+            status_code = status.HTTP_404_NOT_FOUND,
+            detail      = "Tenant record not found.",
+        )
+
+    tenant = tenant_result.data
+    plan   = tenant.get("plans") or {}
+
+    max_vectors = plan.get("max_vectors", 0)
+    max_users   = plan.get("max_users", 0)
+
+    # ── Fetch usage row ────────────────────────────────────────────────────────
+    usage_result = (
+        sb.table("tenant_usage")
+        .select("vector_count, user_count, last_ingestion")
+        .eq("tenant_id", tenant_id)
+        .single()
+        .execute()
+    )
+
+    usage = usage_result.data or {}
+    used_vectors = usage.get("vector_count", 0)
+    used_users   = usage.get("user_count",   0)
+    last_ingestion = usage.get("last_ingestion")
+
+    # ── Calculate percentages (guard div/0) ───────────────────────────────────
+    def _pct(used: int, limit: int) -> float:
+        if limit <= 0:
+            return 0.0
+        return round((used / limit) * 100, 2)
+
+    logger.debug(
+        "[ADMIN/USAGE] tenant=%s  vectors=%d/%d  users=%d/%d  status=%s",
+        request.state.tenant_slug,
+        used_vectors, max_vectors,
+        used_users, max_users,
+        tenant.get("status"),
+    )
+
+    return {
+        "vectors": {
+            "used"   : used_vectors,
+            "limit"  : max_vectors,
+            "percent": _pct(used_vectors, max_vectors),
+        },
+        "users": {
+            "used"   : used_users,
+            "limit"  : max_users,
+            "percent": _pct(used_users, max_users),
+        },
+        "status"       : tenant.get("status"),
+        "plan"         : plan.get("name"),
+        "plan_id"      : plan.get("id"),
+        "trial_ends_at": tenant.get("trial_ends_at"),
+        "last_ingestion": last_ingestion,
+    }
+
+
 # ── POST /admin/ingest ────────────────────────────────────────────────────────
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -228,8 +578,12 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
 @router.delete("/file/{filename}", response_model=DeleteFileResponse)
 async def admin_delete_file(request: Request, filename: str):
     """
-    Delete a file from the knowledge base.
+    Delete a file from the knowledge base by filename.
     Admin only — requires a valid admin JWT.
+
+    NOTE: For Phase 4+, prefer DELETE /admin/documents/{doc_id} which uses
+    the documents table for accurate usage accounting. This endpoint is kept
+    for backward compatibility and requires cloud store to be configured.
     """
     tenant_slug = request.state.tenant_slug
     vs, bm25    = get_tenant_stores(tenant_slug)
@@ -329,6 +683,9 @@ async def admin_list_files(request: Request):
     """
     List all indexed files in this tenant's knowledge base.
     Admin only — requires a valid admin JWT.
+
+    Returns simple filename list from the vector store (Qdrant sources).
+    For richer metadata (chunk_count, file_size, status), use GET /admin/documents.
     """
     tenant_slug = request.state.tenant_slug
     vs, _       = get_tenant_stores(tenant_slug)
