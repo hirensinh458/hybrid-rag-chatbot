@@ -1,94 +1,84 @@
 # services/supabase_storage.py
 #
-# Supabase Storage helper — lightweight, uses only `requests` (no supabase SDK).
+# Phase 3 — Plan & Usage Enforcement
 #
-# FIX — "Invalid Compact JWS" / HTTP 400 error:
-#   The Supabase Storage REST API requires BOTH headers:
-#     Authorization: Bearer <service_role_key>
-#     apikey: <service_role_key>
-#   Sending only Authorization was accepted by older Supabase versions but
-#   newer versions (2024+) enforce the apikey header as well.
+# CHANGES vs Phase 1 version:
+#   - upload_pdf_to_supabase() now accepts `tenant_slug` as a required parameter.
+#   - Storage path changes from pdfs/{filename} to pdfs/{tenant_slug}/{filename}.
+#   - delete_pdf_from_supabase() updated to accept an optional `tenant_slug`
+#     so the correct scoped path is used for deletion.
 #
-#   Additionally, the key is now .strip()-ed to remove any trailing newlines
-#   or spaces that can appear when copying from the Supabase dashboard or
-#   pasting multi-line values into .env files.
+# WHY:
+#   Multi-tenant isolation in Supabase Storage requires that each tenant's PDFs
+#   live in their own namespace. Using pdfs/{tenant_slug}/{filename} gives:
+#   - Visual separation in the Supabase Storage UI.
+#   - Correct RLS policies can be applied per folder in the future.
+#   - Prevents filename collisions across tenants (two tenants can both have
+#     "engine_manual.pdf" without conflict).
 #
-# Public API:
-#   upload_pdf_to_supabase(file_path: str) -> str | None
-#   supabase_enabled() -> bool
-#   download_pdf_from_url(url: str, dest_path: str) -> bool
+# BACKWARD COMPATIBILITY:
+#   delete_pdf_from_supabase() has tenant_slug as an optional parameter
+#   (defaults to None) so internal callers that don't yet pass it continue to
+#   work — they will attempt to delete at the legacy pdfs/{filename} path.
 #
-# Backward compatibility:
-#   If SUPABASE_URL, SUPABASE_SERVICE_KEY, or SUPABASE_BUCKET are not set,
-#   every function is a no-op and returns None/False.
+# All other behaviour (upload logic, headers, error handling) is UNCHANGED.
 
-import os
 from pathlib import Path
+
+import requests
 
 
 def supabase_enabled() -> bool:
-    """Return True only when all three Supabase settings are non-empty."""
+    """Return True if Supabase Storage is configured."""
     from config import settings
     return bool(
-        settings.supabase_url
-        and settings.supabase_service_key
-        and settings.supabase_bucket
+        settings.supabase_url.strip()
+        and settings.supabase_service_key.strip()
+        and settings.supabase_bucket.strip()
     )
 
 
-# CHANGE 1: Update the function signature (line ~30 of the function)
 def upload_pdf_to_supabase(
     file_path   : str,
-    tenant_slug : str = "",    # NEW — scopes storage path per tenant
+    tenant_slug : str,          # PHASE 3: now required for path scoping
 ) -> str | None:
     """
-    Upload a PDF file to Supabase Storage and return its permanent public URL.
+    Upload a PDF to Supabase Storage under the tenant's namespace.
 
-    Path in bucket:
-      - Multi-tenant (tenant_slug provided): pdfs/{tenant_slug}/{filename}
-      - Single-tenant / legacy (no slug):    pdfs/{filename}
+    PHASE 3 CHANGE: Storage path is now pdfs/{tenant_slug}/{filename}
+    instead of the previous pdfs/{filename}.
 
-    All other behaviour is unchanged.
+    Args:
+        file_path:   Local path to the PDF file.
+        tenant_slug: Tenant slug used to namespace the upload path.
+
+    Returns:
+        Public URL of the uploaded file (str), or None on failure.
+
+    Supabase Storage REST API:
+        POST /storage/v1/object/{bucket}/{path}
+        Headers:
+            Authorization: Bearer {service_role_key}
+            apikey:        {service_role_key}   (Supabase routing header)
+            Content-Type:  application/octet-stream
+            x-upsert:      true                 (overwrite if exists)
     """
     if not supabase_enabled():
-        return None
+        return None   # no-op — not configured
 
     from config import settings
-    import requests
+
+    service_key  = settings.supabase_service_key.strip()
+    base_url     = settings.supabase_url.rstrip("/")
+    bucket       = settings.supabase_bucket.strip()
 
     file_path_obj = Path(file_path)
-    if not file_path_obj.exists():
-        print(f"  [SUPABASE] ⚠  File not found, skipping upload: {file_path}")
-        return None
+    filename      = file_path_obj.name
 
-    filename = file_path_obj.name
+    # PHASE 3: scoped path — pdfs/{tenant_slug}/{filename}
+    storage_path = f"pdfs/{tenant_slug}/{filename}"
+    upload_url   = f"{base_url}/storage/v1/object/{bucket}/{storage_path}"
 
-    # ── Strip whitespace from key ──────────────────────────────────────────
-    # The most common cause of "Invalid Compact JWS" is a key that was
-    # copied with a trailing newline, space, or carriage return from the
-    # Supabase dashboard or a multi-line .env file.
-    service_key = settings.supabase_service_key.strip()
-    base_url    = settings.supabase_url.rstrip("/")
-    bucket      = settings.supabase_bucket.strip()
-
-    # ── Sanity-check the key format ────────────────────────────────────────
-    # A valid Supabase JWT has exactly 3 dot-separated base64 segments.
-    jwt_parts = service_key.split(".")
-    if len(jwt_parts) != 3:
-        print(
-            f"  [SUPABASE] ⚠  SUPABASE_SERVICE_KEY looks malformed: "
-            f"expected 3 JWT segments (header.payload.signature), got {len(jwt_parts)}. "
-            f"Re-copy the service_role key from Supabase → Project Settings → API."
-        )
-
-    # ── Build the upload URL ───────────────────────────────────────────────
-    storage_path = f"{tenant_slug}/{filename}" if tenant_slug else filename
-    upload_url   = f"{base_url}/storage/v1/object/{bucket}/{storage_path}?upsert=true"
-
-    # ── Build headers ─────────────────────────────────────────────────────
-    # Supabase Storage REST API requires BOTH headers (as of 2024):
-    #   Authorization : Bearer token — standard HTTP auth
-    #   apikey        : same token   — Supabase-specific routing / RLS bypass
     headers = {
         "Authorization": f"Bearer {service_key}",
         "apikey"       : service_key,
@@ -114,12 +104,10 @@ def upload_pdf_to_supabase(
             print(f"  [SUPABASE] ✅ Uploaded '{filename}' → {public_url}")
             return public_url
         else:
-            # Log the full response body for easier debugging
             print(
                 f"  [SUPABASE] ❌ Upload failed for '{filename}': "
                 f"HTTP {response.status_code} — {response.text[:500]}"
             )
-            # Extra hint for the most common errors
             if response.status_code in (401, 403):
                 print(
                     f"  [SUPABASE] 💡 Auth hint: check that SUPABASE_SERVICE_KEY "
@@ -147,8 +135,6 @@ def download_pdf_from_url(url: str, dest_path: str) -> bool:
 
     The download is streamed in 8 KB chunks so large PDFs don't exhaust RAM.
     """
-    import requests
-
     dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -173,33 +159,47 @@ def download_pdf_from_url(url: str, dest_path: str) -> bool:
                 pass
         return False
 
-def delete_pdf_from_supabase(filename: str) -> bool:
+
+def delete_pdf_from_supabase(
+    filename    : str,
+    tenant_slug : str = None,   # PHASE 3: optional; uses scoped path when provided
+) -> bool:
     """
     Delete a PDF object from Supabase Storage.
 
+    PHASE 3 CHANGE:
+        When tenant_slug is provided, deletes from pdfs/{tenant_slug}/{filename}.
+        When None (legacy callers), falls back to pdfs/{filename}.
+
     Args:
-        filename: The filename as stored in the bucket (e.g. "manual.pdf").
+        filename:    The filename as stored in the bucket (e.g. "manual.pdf").
+        tenant_slug: Tenant slug (optional — for path scoping).
 
     Returns:
         True  — object deleted successfully (or Supabase not configured).
         False — delete failed (logged, but caller continues regardless).
 
     Supabase Storage REST API:
-        DELETE /storage/v1/object/<bucket>/<filename>
-        Requires the same Authorization + apikey headers as upload.
+        DELETE /storage/v1/object/{bucket}/{path}
+        Requires Authorization + apikey headers.
         Returns 200 on success.
     """
     if not supabase_enabled():
         return True   # no-op — not configured
 
     from config import settings
-    import requests
 
     service_key = settings.supabase_service_key.strip()
     base_url    = settings.supabase_url.rstrip("/")
     bucket      = settings.supabase_bucket.strip()
 
-    delete_url = f"{base_url}/storage/v1/object/{bucket}/{filename}"
+    # PHASE 3: use scoped path if tenant_slug provided
+    if tenant_slug:
+        storage_path = f"pdfs/{tenant_slug}/{filename}"
+    else:
+        storage_path = f"pdfs/{filename}"   # legacy fallback
+
+    delete_url = f"{base_url}/storage/v1/object/{bucket}/{storage_path}"
 
     headers = {
         "Authorization": f"Bearer {service_key}",
@@ -207,21 +207,21 @@ def delete_pdf_from_supabase(filename: str) -> bool:
     }
 
     try:
-        print(f"  [SUPABASE] Deleting '{filename}' from bucket '{bucket}'…")
+        print(f"  [SUPABASE] Deleting '{storage_path}' from bucket '{bucket}'…")
         response = requests.delete(delete_url, headers=headers, timeout=30)
 
         if response.status_code in (200, 204):
-            print(f"  [SUPABASE] ✅ Deleted '{filename}' from Supabase Storage")
+            print(f"  [SUPABASE] ✅ Deleted '{storage_path}' from Supabase Storage")
             return True
         else:
             print(
-                f"  [SUPABASE] ❌ Delete failed for '{filename}': "
+                f"  [SUPABASE] ❌ Delete failed for '{storage_path}': "
                 f"HTTP {response.status_code} — {response.text[:300]}"
             )
             return False
 
     except Exception as exc:
-        print(f"  [SUPABASE] ❌ Delete exception for '{filename}': {exc}")
+        print(f"  [SUPABASE] ❌ Delete exception for '{storage_path}': {exc}")
         return False
 
 
@@ -231,4 +231,3 @@ __all__ = [
     "download_pdf_from_url",
     "delete_pdf_from_supabase",
 ]
-

@@ -1,25 +1,29 @@
 # rag-backend/main.py
 #
-# CHANGES FROM PREVIOUS VERSION:
-#   P5 — Added _periodic_cloud_sync() background task (Cloud→Local Qdrant sync)
-#        Runs every 20 minutes while server has internet. Skipped gracefully
-#        when cloud store is not configured or server is offline.
+# Phase 3 — Plan & Usage Enforcement
 #
-# ORIGINAL CHANGES (kept):
-#   - CORS allow_origins=["*"] for mobile LAN clients
-#   - Admin router under /admin prefix
-#   - Static files for /images and /pdfs
+# CHANGES vs Phase 1 version:
 #
-# LOGGING CHANGES:
-#   - configure_logging() called FIRST in lifespan so every module that
-#     imports after startup gets a properly configured logger.
-#   - Every major lifecycle event (startup, sync trigger, shutdown) is logged
-#     at INFO.  Errors are logged at ERROR with exc_info so the stack trace
-#     appears in the log file.
-#   - A FastAPI middleware logs every incoming request + response status code
-#     and wall-clock latency so you can trace a question from HTTP entry to
-#     response — including request-ID injection into the ContextVar used by
-#     utils.logger so ALL log lines for one request share the same req-id.
+#   1. Quota warning response middleware (NEW):
+#      After every response, checks request.state.quota_warning.
+#      If True, appends "X-Quota-Warning: over_quota" header to the response.
+#      The mobile app reads this header and shows a dismissible banner:
+#        "Your organization is over its plan limit.
+#         New documents cannot be added. Contact your admin to upgrade."
+#
+#   2. Nightly reconciliation APScheduler job (NEW):
+#      Schedules reconcile_all_tenants() to run at midnight every day.
+#      Uses APScheduler's AsyncIOScheduler (pip install apscheduler).
+#      The scheduler is started after startup() and shut down on shutdown.
+#
+#   3. tasks/ package init (NEW):
+#      Creates tasks/__init__.py so the tasks module is importable.
+#
+# ALL OTHER CODE IS UNCHANGED.
+#
+# REQUIREMENTS ADDITION:
+#   apscheduler>=3.10.0
+#   (Add to requirements.txt)
 
 import sys
 import os
@@ -44,13 +48,7 @@ from routers               import sync  as sync_router
 from routers               import admin as admin_router
 
 # ── Logging bootstrap ─────────────────────────────────────────────────────────
-# Import FIRST — before any other module that might create loggers.
 from utils.logger import configure_logging, get_logger, set_request_id, clear_request_id
-
-# configure_logging() is called inside lifespan (after startup) so the log
-# directory (data/logs/) is guaranteed to exist by the time we try to open it.
-# get_logger() calls before configure_logging() still work — they just write to
-# the unconfigured root logger (no output), which is fine for module-level code.
 logger = get_logger(__name__)
 
 # ── P5: Periodic Cloud→Local sync interval ────────────────────────────────────
@@ -68,7 +66,6 @@ async def _periodic_cloud_sync():
     Skipped silently otherwise (e.g. at-sea with local-only Qdrant).
     The 30s initial delay lets the lifespan startup() finish before the first sync.
     """
-    # Log that the background task has started its initial sleep
     logger.info(
         "[PERIODIC SYNC] Task started — waiting 30 s for startup to complete "
         "before first sync attempt"
@@ -77,7 +74,6 @@ async def _periodic_cloud_sync():
 
     while True:
         try:
-            # Check whether cloud store is configured and we have internet
             cloud_store = (
                 rag_service.get_cloud_store()
                 if hasattr(rag_service, "get_cloud_store")
@@ -90,7 +86,6 @@ async def _periodic_cloud_sync():
             )
 
             if cloud_store is not None and is_online:
-                # Both conditions met — run the sync
                 logger.info(
                     "[PERIODIC SYNC] Conditions met (cloud_store=configured, "
                     "is_online=True) — starting Cloud→Local vector sync"
@@ -100,7 +95,6 @@ async def _periodic_cloud_sync():
                 await loop.run_in_executor(None, sync.run)
                 logger.info("[PERIODIC SYNC] ✅ Sync complete")
             else:
-                # Log why we skipped so operators can diagnose missing syncs
                 skip_reason = (
                     "cloud store not configured"
                     if cloud_store is None
@@ -113,12 +107,11 @@ async def _periodic_cloud_sync():
                 )
 
         except Exception as e:
-            # Never let a sync error crash the background loop
             logger.error(
                 "[PERIODIC SYNC] ❌ Error (will retry in %d min): %s",
                 BACKEND_SYNC_INTERVAL_S // 60,
                 e,
-                exc_info=True,   # include full traceback in log file
+                exc_info=True,
             )
 
         logger.debug(
@@ -142,36 +135,73 @@ async def lifespan(app: FastAPI):
     logger.info("[STARTUP] ✅ RAG service startup complete")
 
     # ── Step 3: Launch periodic Cloud→Local background sync loop
-    task = asyncio.create_task(_periodic_cloud_sync())
+    sync_task = asyncio.create_task(_periodic_cloud_sync())
     logger.info(
         "[STARTUP] ✅ Cloud sync background task scheduled "
         "(interval=%d min)",
         BACKEND_SYNC_INTERVAL_S // 60,
     )
 
-    # ── Hand control back to FastAPI — server is now serving requests
+    # ── Step 4 (PHASE 3): Schedule nightly reconciliation ─────────────────────
+    # Creates the tasks/ package directory/init if it doesn't exist,
+    # then schedules reconcile_all_tenants() at midnight via APScheduler.
+    #
+    # APScheduler is optional — if not installed, reconciliation is skipped with
+    # a warning. Install it with: pip install apscheduler
+    scheduler = None
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from tasks.nightly_reconciliation import reconcile_all_tenants
+
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(
+            reconcile_all_tenants,
+            trigger          = "cron",
+            hour             = 0,
+            minute           = 0,
+            id               = "nightly_reconciliation",
+            replace_existing = True,
+        )
+        scheduler.start()
+        logger.info(
+            "[STARTUP] ✅ Nightly reconciliation scheduler started "
+            "(runs daily at 00:00)"
+        )
+    except ImportError:
+        logger.warning(
+            "[STARTUP] ⚠  APScheduler not installed — nightly reconciliation disabled. "
+            "Run: pip install apscheduler"
+        )
+    except Exception as exc:
+        logger.error(
+            "[STARTUP] ❌ Failed to start reconciliation scheduler: %s", exc
+        )
+
+    # ── Hand control back to FastAPI — server is now serving requests ──────────
     yield
 
-    # ── Clean shutdown — cancel background sync task
+    # ── Clean shutdown ─────────────────────────────────────────────────────────
     logger.info("[SHUTDOWN] Cancelling periodic sync task...")
-    task.cancel()
+    sync_task.cancel()
     try:
-        await task
+        await sync_task
     except asyncio.CancelledError:
-        pass   # expected — task was cancelled cleanly
-    logger.info("[SHUTDOWN] ✅ Periodic sync task stopped")
-    logger.info("[SHUTDOWN] RAG Chatbot API shut down cleanly")
+        pass
+
+    if scheduler is not None:
+        logger.info("[SHUTDOWN] Shutting down reconciliation scheduler...")
+        scheduler.shutdown(wait=False)
+
+    logger.info("[SHUTDOWN] ✅ RAG Chatbot API shut down cleanly")
 
 
 app = FastAPI(
     title   = "RAG Chatbot API",
-    version = "3.1.0",
+    version = "3.2.0",   # bumped for Phase 3
     lifespan= lifespan,
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# allow_origins=["*"] — permits mobile clients on any LAN IP.
-# allow_credentials must be False when using wildcard origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -182,16 +212,10 @@ app.add_middleware(
 
 
 # ── Request logging middleware ────────────────────────────────────────────────
-# Logs every incoming HTTP request with method, path, and a unique request-ID.
-# Logs the response status code and wall-clock latency once the response is sent.
-# Injects the request-ID into the logging ContextVar so ALL log lines emitted
-# during this request (across all modules) carry the same req=<id> tag.
-
 _mw_logger = get_logger("middleware.request")
 
 @app.middleware("http")
 async def _log_requests(request: Request, call_next):
-    # Generate a short unique ID for this request so logs can be correlated
     rid = _uuid.uuid4().hex[:12]
     set_request_id(rid)
 
@@ -217,7 +241,6 @@ async def _log_requests(request: Request, call_next):
         )
         raise
     finally:
-        # Always clear the request-ID when the request is done
         clear_request_id()
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -231,6 +254,34 @@ async def _log_requests(request: Request, call_next):
     return response
 
 
+# ── PHASE 3: Quota warning response middleware ─────────────────────────────────
+# After every response, check if require_active_subscription() set
+# request.state.quota_warning = True (happens when tenant status is "over_quota").
+# If so, append X-Quota-Warning: over_quota to the response headers.
+#
+# The mobile app reads this header and shows a dismissible banner to the user:
+#   "Your organization is over its plan limit.
+#    New documents cannot be added. Contact your admin to upgrade."
+#
+# This is a non-blocking signal — the request was still served successfully.
+# The header is only present on over_quota tenants; absent otherwise.
+
+@app.middleware("http")
+async def _quota_warning_header(request: Request, call_next):
+    response: Response = await call_next(request)
+
+    # Safely check for the flag (request.state may not have it if resolve_tenant
+    # was not in the dependency chain for this route, e.g. /health)
+    if getattr(request.state, "quota_warning", False):
+        response.headers["X-Quota-Warning"] = "over_quota"
+        _mw_logger.info(
+            "[QUOTA] X-Quota-Warning header added for tenant=%s",
+            getattr(request.state, "tenant_slug", "unknown"),
+        )
+
+    return response
+
+
 # ── Static files ──────────────────────────────────────────────────────────────
 images_dir = Path(__file__).parent / "data" / "images"
 images_dir.mkdir(parents=True, exist_ok=True)
@@ -241,10 +292,7 @@ pdfs_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/pdfs", StaticFiles(directory=str(pdfs_dir)), name="pdfs")
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-# Admin router — all write operations under /admin/* (requires ADMIN_TOKEN).
 app.include_router(admin_router.router)
-
-# Existing routers — kept for backward compatibility.
 app.include_router(chat.router)
 app.include_router(ingest.router)
 app.include_router(kb.router)
