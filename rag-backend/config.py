@@ -141,6 +141,21 @@ class Settings(BaseSettings):
     #   Authorization: Bearer <your-token>
     admin_token: str = ""
 
+    # ── Multi-tenancy (Phase 1) ───────────────────────────────────────────────────
+    # supabase_anon_key: used for JWT verification and client-facing Supabase calls.
+    #   Find it in Supabase → Project Settings → API → "anon public" key.
+    #   (NOT the service_role key — this one is safe to expose to the browser.)
+    #
+    # super_admin_allowed_ips: comma-separated list of IPs that may access the
+    #   super-admin portal (e.g. "10.0.0.1,192.168.1.5"). Leave empty to disable
+    #   the IP allowlist (dev mode — all IPs allowed).
+    supabase_anon_key        : str = ""   # anon/public key (not service_role)
+    super_admin_allowed_ips  : str = ""   # e.g. "10.0.0.1,192.168.1.5"
+
+    # NOTE: qdrant_collection is kept for single-tenant / local dev fallback.
+    # In multi-tenant mode the collection name is derived dynamically as
+    # rag_docs_{tenant_slug} by get_vector_store() in vectorstore/factory.py.
+
     class Config:
         env_file          = ".env"
         env_file_encoding = "utf-8"
@@ -186,6 +201,8 @@ print(f"[CONFIG]  Supabase URL      : {settings.supabase_url or '(not configured
 print(f"[CONFIG]  Supabase bucket   : {settings.supabase_bucket}")
 print(f"[CONFIG]  Supabase key      : {'set' if settings.supabase_service_key else 'not set'}")
 print(f"[CONFIG]  Admin token       : {'set' if settings.admin_token else 'not set (open dev mode)'}")
+print(f"[CONFIG]  Supabase anon key  : {'set' if settings.supabase_anon_key else 'not set'}")
+print(f"[CONFIG]  Super-admin IPs    : {settings.super_admin_allowed_ips or '(all IPs — dev mode)'}")
 print(f"[CONFIG]  Network check URL : {settings.network_check_url}")
 print(f"[CONFIG]  Network poll      : every {settings.network_poll_interval}s  timeout={settings.network_check_timeout}s")
 print(f"[CONFIG]  Sync manifest URL : {settings.sync_manifest_url or '(not set — PDF manifest sync disabled)'}")

@@ -45,9 +45,20 @@ from services import rag_service
 from config import settings
 from utils.logger import get_logger
 
+# Phase 1 — Multi-Tenancy: tenant resolver dependencies
+from fastapi import Depends
+from middleware.tenant_resolver import resolve_tenant, require_active_subscription
+from services.rag_service import get_tenant_stores
+
 logger = get_logger(__name__)
 
-router = APIRouter(tags=["chat"])
+router = APIRouter(
+    tags=["chat"],
+    dependencies=[
+        Depends(resolve_tenant),
+        Depends(require_active_subscription),
+    ],
+)
 
 
 class PinRequest(BaseModel):
@@ -206,13 +217,15 @@ def _build_offline_response(question: str, final_chunks: list) -> OfflineQueryRe
 # ── Chat stream (online) / chunk response (offline) ──────────
 
 @router.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(request: Request, req: ChatRequest):
     """
     Online  → SSE stream of tokens then a done event with citations.
     Offline → Normal JSON response (OfflineQueryResponse) with manual sections.
               No SSE needed — there is no LLM streaming in offline mode.
     """
-    vector_store = rag_service.get_vector_store()
+    slug         = request.state.tenant_slug
+    vs, _bm25    = get_tenant_stores(slug)
+    vector_store = vs
     has_kb       = vector_store.count() > 0
     chain        = rag_service.get_chain()
     online       = rag_service.is_online()
@@ -369,7 +382,7 @@ async def chat_stream(req: ChatRequest):
 # ── Intranet-only / forced offline endpoint ───────────────────────────────────
 
 @router.post("/chat/offline")
-async def chat_offline(req: ChatRequest):
+async def chat_offline(request: Request, req: ChatRequest):
     """
     Intranet-only mode (Mode 2):
     Server is reachable via LAN but there is no internet for Groq.
@@ -384,9 +397,10 @@ async def chat_offline(req: ChatRequest):
     The retrieval + reranker logic is identical to the offline branch inside
     /chat/stream — both share the same _run_offline_retrieval() helper above.
     """
-    chain        = rag_service.get_chain()
-    active_store = rag_service.get_local_store()
     has_kb       = active_store.count() > 0
+    slug         = request.state.tenant_slug
+    active_store, _bm25 = get_tenant_stores(slug)
+    chain        = rag_service.get_chain()
 
     logger.info(
         "[CHAT/OFFLINE] /chat/offline (Mode 2) — has_kb=%s  store=%s(%d)  question_len=%d",

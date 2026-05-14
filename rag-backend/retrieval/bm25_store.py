@@ -32,7 +32,7 @@ import pickle
 from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import BM25_PATH
+from config import BM25_PATH, settings   # add `settings` to existing import
 
 from rank_bm25 import BM25Okapi
 
@@ -145,8 +145,35 @@ class BM25Store:
     the vocabulary at index time matches the vocabulary at query time.
     """
 
-    def __init__(self, path: str = BM25_PATH):
-        self.path             = path
+    # REPLACE the existing __init__ method inside class BM25Store with this:
+
+    def __init__(self, path: str = None, tenant_slug: str = None):
+        """
+        Initialise the BM25 store.
+
+        Resolution order for the pickle file path:
+        1. Explicit `path` argument (legacy / internal callers) — used as-is.
+        2. `tenant_slug` provided → data/bm25/bm25_{tenant_slug}.pkl
+            (per-tenant isolation; directory created automatically).
+        3. Neither provided → global BM25_PATH constant (single-tenant dev mode,
+            backward compatible with all existing callers).
+
+        Args:
+            path:        Explicit file path. Takes priority over tenant_slug.
+            tenant_slug: Tenant identifier. Derives path automatically when set.
+        """
+        if path is not None:
+            # Legacy / explicit path — unchanged behaviour
+            self._path = path
+        elif tenant_slug:
+            # Multi-tenant: one .pkl file per tenant under data/bm25/
+            bm25_dir = Path(settings.qdrant_path).parent / "bm25"
+            bm25_dir.mkdir(parents=True, exist_ok=True)
+            self._path = str(bm25_dir / f"bm25_{tenant_slug}.pkl")
+        else:
+            # Single-tenant dev mode fallback
+            self._path = BM25_PATH
+
         self._chunks: list[dict] = []
         self._bm25: BM25Okapi    = None
         self._load()

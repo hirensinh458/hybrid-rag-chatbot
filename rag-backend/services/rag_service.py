@@ -40,6 +40,7 @@ from vectorstore.base           import BaseVectorStore
 from vectorstore.factory        import get_vector_store as _factory_get_store
 from chains.rag_chain           import RAGChain
 
+from functools import lru_cache as _lru_cache
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 _embedder        : object = None
@@ -52,6 +53,44 @@ _network_monitor : object = None
 
 _lock = threading.Lock()
 _tasks: dict = {}
+
+# ── Per-tenant store cache (Phase 1 — Multi-Tenancy) ─────────────────────────
+
+@_lru_cache(maxsize=100)   # holds up to 100 tenant (vector_store, bm25) pairs
+def get_tenant_stores(tenant_slug: str):
+    """
+    Return a (vector_store, bm25_store) pair scoped to the given tenant.
+
+    Results are cached per slug for the process lifetime so repeated requests
+    from the same tenant reuse the same store instances (no reconnect overhead).
+
+    The lru_cache is keyed on tenant_slug (a plain string) — thread-safe in
+    CPython because lru_cache uses an internal lock.
+
+    Args:
+        tenant_slug: Tenant identifier derived from request.state.tenant_slug.
+
+    Returns:
+        (BaseVectorStore, BM25Store) — both scoped to this tenant.
+
+    Example:
+        vs, bm25 = get_tenant_stores("acme_shipping")
+        # vs  → Qdrant collection "rag_docs_acme_shipping"
+        # bm25 → data/bm25/bm25_acme_shipping.pkl
+    """
+    from vectorstore.factory import get_vector_store as _factory_get_store
+    from retrieval.bm25_store import BM25Store
+
+    vs   = _factory_get_store(
+        vendor      = settings.vector_store_vendor,
+        mode        = "local",
+        embedder    = _embedder,        # reuse the global singleton embedder
+        tenant_slug = tenant_slug,
+    )
+    bm25 = BM25Store(tenant_slug=tenant_slug)
+
+    print(f"  [SERVICE] get_tenant_stores('{tenant_slug}') — stores initialised")
+    return vs, bm25
 
 
 # ── HYBRID STORE ACCESSOR ─────────────────────────────────────────────────────

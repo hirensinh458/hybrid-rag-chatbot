@@ -36,25 +36,19 @@ def supabase_enabled() -> bool:
     )
 
 
-def upload_pdf_to_supabase(file_path: str) -> str | None:
+# CHANGE 1: Update the function signature (line ~30 of the function)
+def upload_pdf_to_supabase(
+    file_path   : str,
+    tenant_slug : str = "",    # NEW — scopes storage path per tenant
+) -> str | None:
     """
     Upload a PDF file to Supabase Storage and return its permanent public URL.
 
-    FIX: Now sends both 'Authorization' and 'apikey' headers, and strips the
-    service key of whitespace before use.  Supabase Storage REST API (v1)
-    requires the apikey header in addition to Authorization — sending only
-    Authorization causes HTTP 400 "Invalid Compact JWS" on newer projects.
+    Path in bucket:
+      - Multi-tenant (tenant_slug provided): pdfs/{tenant_slug}/{filename}
+      - Single-tenant / legacy (no slug):    pdfs/{filename}
 
-    Args:
-        file_path: Absolute or relative path to the PDF file on disk.
-
-    Returns:
-        Public URL string on success:
-            https://<project>.supabase.co/storage/v1/object/public/<bucket>/<filename>
-        None if Supabase is not configured, file not found, or upload fails.
-
-    The function is idempotent: uploading the same filename twice will
-    upsert (overwrite) the existing object in Supabase Storage.
+    All other behaviour is unchanged.
     """
     if not supabase_enabled():
         return None
@@ -88,8 +82,8 @@ def upload_pdf_to_supabase(file_path: str) -> str | None:
         )
 
     # ── Build the upload URL ───────────────────────────────────────────────
-    # POST /storage/v1/object/<bucket>/<filename>?upsert=true
-    upload_url = f"{base_url}/storage/v1/object/{bucket}/{filename}?upsert=true"
+    storage_path = f"{tenant_slug}/{filename}" if tenant_slug else filename
+    upload_url   = f"{base_url}/storage/v1/object/{bucket}/{storage_path}?upsert=true"
 
     # ── Build headers ─────────────────────────────────────────────────────
     # Supabase Storage REST API requires BOTH headers (as of 2024):
@@ -115,7 +109,7 @@ def upload_pdf_to_supabase(file_path: str) -> str | None:
 
         if response.status_code in (200, 201):
             public_url = (
-                f"{base_url}/storage/v1/object/public/{bucket}/{filename}"
+                f"{base_url}/storage/v1/object/public/{bucket}/{storage_path}"
             )
             print(f"  [SUPABASE] ✅ Uploaded '{filename}' → {public_url}")
             return public_url
