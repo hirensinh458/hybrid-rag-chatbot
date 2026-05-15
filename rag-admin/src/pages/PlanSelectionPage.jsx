@@ -68,7 +68,7 @@ export default function PlanSelectionPage() {
     setSelecting(plan.id)
     // For Starter: backend will have set plan on tenant creation.
     // Just navigate to onboarding.
-    setTimeout(() => navigate('/onboarding', { replace: true }), 400)
+    setTimeout(() => navigate('/login', { replace: true }), 400)
   }
 
   return (

@@ -44,30 +44,22 @@ export default function SignupPage() {
   }
 
   const handleSubmit = async (e) => {
-    e.preventDefault()
-    setError('')
+  e.preventDefault()
+  setError('')
+  if (password.length < 8) { setError('Password must be at least 8 characters.'); return }
+  if (!company.trim()) { setError('Company name is required.'); return }
 
-    if (password.length < 8) { setError('Password must be at least 8 characters.'); return }
-    if (!company.trim())     { setError('Company name is required.'); return }
-
-    setLoading(true)
-    try {
-      await signup(email.trim(), password, company.trim())
-      // signup() internally calls signInWithPassword after backend creates the user.
-      // If email confirmation is OFF → session is set → AuthRedirect handles navigation.
-      // If email confirmation is ON  → signInWithPassword throws → caught below.
-    } catch (err) {
-      const msg = err.message?.toLowerCase() ?? ''
-      // Supabase throws "Email not confirmed" when confirmation is required
-      if (msg.includes('not confirmed') || msg.includes('confirm') || msg.includes('verify')) {
-        navigate('/verify', { replace: true })
-      } else {
-        setError(err.message)
-      }
-    } finally {
-      setLoading(false)
-    }
+  setLoading(true)
+  try {
+    await signup(email.trim(), password, company.trim())
+    // Signup done — send them to login (or /plans if you want plan selection first)
+    navigate('/login', { replace: true })
+  } catch (err) {
+    setError(err.message)
+  } finally {
+    setLoading(false)
   }
+}
 
   const strengthColors = ['var(--danger)', 'var(--warn)', '#22c55e']
   const strengthLabels = ['Weak', 'Fair', 'Strong']

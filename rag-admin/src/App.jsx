@@ -8,15 +8,15 @@
 //   - Session, onboarded      → dashboard (/)
 
 import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
-import { useEffect }        from 'react'
-import { useAuth }          from './context/AuthContext'
+import { useEffect } from 'react'
+import { useAuth } from './context/AuthContext'
 
-import LoginPage         from './pages/LoginPage'
-import SignupPage        from './pages/SignupPage'
-import VerifyEmailPage   from './pages/VerifyEmailPage'
+import LoginPage from './pages/LoginPage'
+import SignupPage from './pages/SignupPage'
+import VerifyEmailPage from './pages/VerifyEmailPage'
 import PlanSelectionPage from './pages/PlanSelectionPage'
-import OnboardingPage    from './pages/OnboardingPage'
-import DashboardPage     from './pages/DashboardPage'
+import OnboardingPage from './pages/OnboardingPage'
+import DashboardPage from './pages/DashboardPage'
 
 // ── Spinner ────────────────────────────────────────────────────────────────────
 function SplashScreen() {
@@ -44,29 +44,42 @@ function SplashScreen() {
 // reactively so navigation always reflects the current session state.
 function AuthRedirect() {
   const { isAuthenticated, isOnboardingComplete, loading, tenant } = useAuth()
-  const navigate  = useNavigate()
-  const location  = useLocation()
+  const navigate = useNavigate()
+  const location = useLocation()
 
   useEffect(() => {
     if (loading) return
 
     const path = location.pathname
 
-    // Public paths — don't interfere
-    if (['/login', '/signup', '/verify', '/plans'].includes(path)) return
-
+    // 1. Not authenticated → only public routes allowed
     if (!isAuthenticated) {
-      navigate('/login', { replace: true })
+      if (!['/login', '/signup', '/verify'].includes(path)) {
+        navigate('/login', { replace: true })
+      }
       return
     }
 
-    // Authenticated but no tenant yet (just confirmed email, no plan chosen)
+    // 2. Authenticated – redirect away from login/signup/verify
+    if (['/login', '/signup', '/verify'].includes(path)) {
+      // Send to appropriate destination based on tenant state
+      if (!tenant?.slug) {
+        navigate('/plans', { replace: true })
+      } else if (!isOnboardingComplete()) {
+        navigate('/onboarding', { replace: true })
+      } else {
+        navigate('/', { replace: true })
+      }
+      return
+    }
+
+    // 3. Authenticated but no tenant – only /plans allowed
     if (!tenant?.slug && path !== '/plans') {
       navigate('/plans', { replace: true })
       return
     }
 
-    // Authenticated + tenant, but onboarding not done
+    // 4. Authenticated + tenant but onboarding incomplete – only /onboarding allowed
     if (tenant?.slug && !isOnboardingComplete() && path !== '/onboarding') {
       navigate('/onboarding', { replace: true })
       return
@@ -99,10 +112,10 @@ export default function App() {
 
       <Routes>
         {/* Public */}
-        <Route path="/login"  element={<LoginPage />} />
+        <Route path="/login" element={<LoginPage />} />
         <Route path="/signup" element={<SignupPage />} />
         <Route path="/verify" element={<VerifyEmailPage />} />
-        <Route path="/plans"  element={<PlanSelectionPage />} />
+        <Route path="/plans" element={<PlanSelectionPage />} />
 
         {/* Protected */}
         <Route

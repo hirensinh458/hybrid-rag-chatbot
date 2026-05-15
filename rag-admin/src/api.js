@@ -31,9 +31,9 @@ async function getAuthHeaders(extra = {}) {
 
 async function handleResponse(res) {
   if (res.status === 401) {
-    // Token expired or invalid — trigger a sign out so the app redirects to login
-    await supabase.auth.signOut()
-    throw new Error('Session expired. Please sign in again.')
+    // Don't auto sign-out — just throw, let the caller decide
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail ?? 'Unauthorized')
   }
   if (res.status === 402) {
     const err = await res.json().catch(() => ({}))
