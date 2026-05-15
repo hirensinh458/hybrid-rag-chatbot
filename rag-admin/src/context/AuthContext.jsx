@@ -23,197 +23,219 @@ import { supabase } from '../supabase'
 import { adminGetUsage, adminGetJoinCode } from '../api'
 
 // ── JWT decode helper ─────────────────────────────────────────────────────────
-// Client-side only — no signature verification needed here.
-// The backend (tenant_resolver.py) does the cryptographic verification.
 function decodeJwtPayload(token) {
-  try {
-    const part = token.split('.')[1]
-    // Convert base64url → base64 → JSON
-    const b64 = part.replace(/-/g, '+').replace(/_/g, '/')
-    return JSON.parse(atob(b64))
-  } catch {
-    return {}
-  }
+    try {
+        const part = token.split('.')[1]
+        const b64 = part.replace(/-/g, '+').replace(/_/g, '/')
+        return JSON.parse(atob(b64))
+    } catch {
+        return {}
+    }
 }
 
-// Pull app_metadata out of the actual JWT token (not the user object).
 function getJwtAppMeta(session) {
-  if (!session?.access_token) return {}
-  const payload = decodeJwtPayload(session.access_token)
-  return payload.app_metadata ?? {}
+    if (!session?.access_token) return {}
+    const payload = decodeJwtPayload(session.access_token)
+    return payload.app_metadata ?? {}
 }
 
 // ── Context ───────────────────────────────────────────────────────────────────
-
 const AuthContext = createContext(null)
 
 // ── Provider ──────────────────────────────────────────────────────────────────
-
 export function AuthProvider({ children }) {
-  const [session,   setSession]   = useState(null)   // Supabase session object
-  const [tenant,    setTenant]    = useState(null)   // { display_name, slug, status, … }
-  const [plan,      setPlan]      = useState(null)   // { name, max_vectors, max_users, … }
-  const [usage,     setUsage]     = useState(null)   // { vectors, users, status, plan }
-  const [joinCode,  setJoinCode]  = useState(null)   // "SHIP-4829"
-  const [loading,   setLoading]   = useState(true)   // true during initial session restore
+    const [session, setSession] = useState(null)
+    const [tenant, setTenant] = useState(null)
+    const [plan, setPlan] = useState(null)
+    const [usage, setUsage] = useState(null)
+    const [joinCode, setJoinCode] = useState(null)
+    const [loading, setLoading] = useState(true)
+    // Separate state for onboarding flag – updated synchronously from fresh JWT
+    const [onboardingComplete, setOnboardingComplete] = useState(false)
 
-  // ── Hydrate tenant data once we have a valid session ──────────────────────
-  const hydrateTenant = useCallback(async (sess) => {
-    if (!sess) {
-      setTenant(null); setPlan(null); setUsage(null); setJoinCode(null)
-      return
-    }
-
-    // Read from the DECODED JWT — not sess.user.app_metadata.
-    // Supabase hooks inject claims into the token only, not the DB user row.
-    const meta = getJwtAppMeta(sess)
-
-    if (!meta.tenant_id) {
-      // New user whose JWT has no tenant context yet, or token not yet refreshed.
-      console.log('[AuthContext] No tenant_id in JWT — skipping hydrate')
-      return
-    }
-
-    console.log(
-      '[AuthContext] JWT has tenant_id=%s  role=%s',
-      meta.tenant_id, meta.role,
-    )
-
-    try {
-      const [usageData, joinCodeData] = await Promise.all([
-        adminGetUsage(),
-        adminGetJoinCode(),
-      ])
-      setUsage(usageData)
-      setJoinCode(joinCodeData?.join_code ?? null)
-
-      // Extract tenant/plan info from usage response (backend returns them merged)
-      setTenant({
-        display_name: usageData?.display_name ?? '',
-        slug:         usageData?.slug         ?? '',
-        status:       usageData?.status       ?? 'active',
-      })
-      setPlan({
-        name:        usageData?.plan                     ?? '',
-        max_vectors: usageData?.vectors?.limit           ?? 0,
-        max_users:   usageData?.users?.limit             ?? 0,
-      })
-    } catch (err) {
-      // Non-fatal — user might be signed in but tenant not fully set up yet
-      console.warn('[AuthContext] Failed to hydrate tenant data:', err.message)
-    }
-  }, [])
-
-  // ── Initial session restore + auth state listener ─────────────────────────
-  useEffect(() => {
-    let mounted = true
-
-    const init = async () => {
-      const { data: { session: sess } } = await supabase.auth.getSession()
-      if (!mounted) return
-      setSession(sess)
-      try {
-        await hydrateTenant(sess)
-      } finally {
-        if (mounted) setLoading(false)
-      }
-    }
-    init()
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (_event, sess) => {
-        if (!mounted) return
-        setSession(sess)
-        try {
-          await hydrateTenant(sess)
-        } finally {
-          setLoading(false)
+    // ── Helper to extract onboarding flag from a session ────────────────────
+    const updateOnboardingFlag = useCallback((sess) => {
+        if (!sess) {
+            setOnboardingComplete(false)
+            return
         }
-      }
-    )
+        const meta = getJwtAppMeta(sess)
+        const isComplete = meta.onboarding_complete === true
+        console.log('[AuthContext] updateOnboardingFlag:', isComplete)
+        setOnboardingComplete(isComplete)
+    }, [])
 
-    return () => {
-      mounted = false
-      subscription.unsubscribe()
+    // ── Hydrate tenant data once we have a valid session ──────────────────────
+    const hydrateTenant = useCallback(async (sess) => {
+        if (!sess) {
+            setTenant(null); setPlan(null); setUsage(null); setJoinCode(null)
+            return
+        }
+
+        const meta = getJwtAppMeta(sess)
+        if (!meta.tenant_id) {
+            console.log('[AuthContext] No tenant_id in JWT — skipping hydrate')
+            return
+        }
+
+        console.log('[AuthContext] JWT has tenant_id=%s role=%s', meta.tenant_id, meta.role)
+
+        let tenantData = null
+        let planData = null
+
+        try {
+            const [usageData, joinCodeData] = await Promise.all([
+                adminGetUsage(),
+                adminGetJoinCode(),
+            ])
+            setUsage(usageData)
+            setJoinCode(joinCodeData?.join_code ?? null)
+
+            tenantData = {
+                display_name: usageData?.display_name ?? '',
+                slug: usageData?.slug ?? '',
+                status: usageData?.status ?? 'active',
+            }
+            planData = {
+                name: usageData?.plan ?? '',
+                max_vectors: usageData?.vectors?.limit ?? 0,
+                max_users: usageData?.users?.limit ?? 0,
+            }
+        } catch (err) {
+            console.warn('[AuthContext] Failed to hydrate tenant data from API:', err.message)
+            // Fallback to JWT claims (only tenant_id is guaranteed)
+            tenantData = {
+                display_name: meta.tenant_name || 'My Workspace',
+                slug: meta.tenant_slug || meta.tenant_id,
+                status: 'active',
+            }
+            // planData remains null
+        }
+
+        if (tenantData) setTenant(tenantData)
+        if (planData) setPlan(planData)
+    }, [])
+
+    // ── Initial session restore + auth state listener ─────────────────────────
+    useEffect(() => {
+        let mounted = true
+        let timeoutId = null
+
+        const handleAuthChange = async (sess) => {
+            if (!mounted) return
+            setLoading(true)
+            setSession(sess)
+            updateOnboardingFlag(sess)
+            try {
+                await hydrateTenant(sess)
+            } catch (err) {
+                console.error('[AuthContext] hydrateTenant error:', err)
+            } finally {
+                if (mounted) setLoading(false)
+            }
+        }
+
+        const debouncedHandle = (sess) => {
+            if (timeoutId) clearTimeout(timeoutId)
+            timeoutId = setTimeout(() => handleAuthChange(sess), 50)
+        }
+
+        const { data: { subscription } } = supabase.auth.onAuthStateChange(
+            async (event, sess) => {
+                if (!mounted) return
+                console.log('[AuthContext] Auth event (debounced):', event)
+                debouncedHandle(sess)
+            }
+        )
+
+        const init = async () => {
+            const { data: { session: sess } } = await supabase.auth.getSession()
+            if (!mounted) return
+            setSession(sess)
+            updateOnboardingFlag(sess)
+            try {
+                await hydrateTenant(sess)
+            } finally {
+                if (mounted) setLoading(false)
+            }
+        }
+        init()
+
+        return () => {
+            mounted = false
+            subscription.unsubscribe()
+            if (timeoutId) clearTimeout(timeoutId)
+        }
+    }, [hydrateTenant, updateOnboardingFlag])
+
+    // ── Auth actions ──────────────────────────────────────────────────────────
+    const login = async (email, password) => {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+        if (error) throw new Error(error.message)
+        return data
     }
-  }, [hydrateTenant])
 
-  // ── Auth actions ──────────────────────────────────────────────────────────
-
-  const login = async (email, password) => {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) throw new Error(error.message)
-    return data
-  }
-
-  const signup = async (email, password, companyName) => {
-    const res = await fetch('/auth/admin/signup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, company_name: companyName }),
-    })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.detail?.message ?? err.detail ?? 'Signup failed')
+    const signup = async (email, password, companyName) => {
+        const res = await fetch('/auth/admin/signup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password, company_name: companyName }),
+        })
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}))
+            throw new Error(err.detail?.message ?? err.detail ?? 'Signup failed')
+        }
+        return await res.json()
     }
-    return await res.json()   // { message, join_code, slug }
-    // NO signInWithPassword here — user logs in explicitly after plan selection
-  }
 
-  const logout = async () => {
-    await supabase.auth.signOut()
-    setSession(null); setTenant(null); setPlan(null); setUsage(null); setJoinCode(null)
-  }
+    const logout = async () => {
+        await supabase.auth.signOut()
+        setSession(null)
+        setTenant(null)
+        setPlan(null)
+        setUsage(null)
+        setJoinCode(null)
+        setOnboardingComplete(false)
+    }
 
-  // ── Refresh just usage (called after ingest/delete) ───────────────────────
-  const refreshUsage = useCallback(async () => {
-    try {
-      const usageData = await adminGetUsage()
-      setUsage(usageData)
-    } catch { /* non-fatal */ }
-  }, [])
+    const refreshUsage = useCallback(async () => {
+        try {
+            const usageData = await adminGetUsage()
+            setUsage(usageData)
+        } catch { /* non-fatal */ }
+    }, [])
 
-  const refreshJoinCode = useCallback(async () => {
-    try {
-      const data = await adminGetJoinCode()
-      setJoinCode(data?.join_code ?? null)
-    } catch { /* non-fatal */ }
-  }, [])
+    const refreshJoinCode = useCallback(async () => {
+        try {
+            const data = await adminGetJoinCode()
+            setJoinCode(data?.join_code ?? null)
+        } catch { /* non-fatal */ }
+    }, [])
 
-  // ── Onboarding complete helper ────────────────────────────────────────────
-  // Reads from the decoded JWT (same reason as hydrateTenant — backend sets
-  // this flag via update_user_by_id which writes to the DB, so it WILL appear
-  // in both the JWT and the user object after a refreshSession() call).
-  // We read from the JWT for consistency with all other app_metadata reads.
-  const isOnboardingComplete = useCallback(() => {
-    if (!session) return false
-    const meta = getJwtAppMeta(session)
-    return meta.onboarding_complete === true
-  }, [session])
+    // Now just returns the derived state (no JWT decode on every call)
+    const isOnboardingComplete = useCallback(() => onboardingComplete, [onboardingComplete])
 
-  const value = {
-    session,
-    tenant,
-    plan,
-    usage,
-    joinCode,
-    loading,
-    isAuthenticated: !!session,
-    login,
-    signup,
-    logout,
-    refreshUsage,
-    refreshJoinCode,
-    isOnboardingComplete,
-  }
+    const value = {
+        session,
+        tenant,
+        plan,
+        usage,
+        joinCode,
+        loading,
+        isAuthenticated: !!session,
+        login,
+        signup,
+        logout,
+        refreshUsage,
+        refreshJoinCode,
+        isOnboardingComplete,
+    }
 
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
+    return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
-// ── Hook ──────────────────────────────────────────────────────────────────────
-
 export function useAuth() {
-  const ctx = useContext(AuthContext)
-  if (!ctx) throw new Error('useAuth must be used inside <AuthProvider>')
-  return ctx
+    const ctx = useContext(AuthContext)
+    if (!ctx) throw new Error('useAuth must be used inside <AuthProvider>')
+    return ctx
 }

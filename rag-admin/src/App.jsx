@@ -43,18 +43,30 @@ function SplashScreen() {
 // ── Auth-driven redirect component ────────────────────────────────────────────
 // Mounted on every protected route. Watches auth state and redirects
 // reactively so navigation always reflects the current session state.
+//
+// Rule evaluation order matters — every branch must `return` so only one
+// redirect fires per render cycle.
 function AuthRedirect() {
   const { isAuthenticated, isOnboardingComplete, loading, tenant } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
 
   useEffect(() => {
+    // While AuthContext is hydrating (initial load OR after any auth event),
+    // do nothing. App renders <SplashScreen /> during this window anyway.
     if (loading) return
+
+    console.log('[AuthRedirect]', {
+      path: location.pathname,
+      isAuthenticated,
+      tenantSlug: tenant?.slug,
+      onboardingComplete: isOnboardingComplete(),
+      loading,
+    })
 
     const path = location.pathname
 
     // 1. Not authenticated → only public routes allowed
-    // /plans and /payment are public — user is not yet logged in when visiting them
     if (!isAuthenticated) {
       if (!['/login', '/signup', '/verify', '/plans', '/payment'].includes(path)) {
         navigate('/login', { replace: true })
@@ -64,7 +76,6 @@ function AuthRedirect() {
 
     // 2. Authenticated – redirect away from auth/pre-auth pages
     if (['/login', '/signup', '/verify', '/payment'].includes(path)) {
-      // Send to appropriate destination based on tenant state
       if (!tenant?.slug) {
         navigate('/plans', { replace: true })
       } else if (!isOnboardingComplete()) {
@@ -86,6 +97,18 @@ function AuthRedirect() {
       navigate('/onboarding', { replace: true })
       return
     }
+
+    // 5. ── FIX: Onboarding complete but still on /onboarding → go to dashboard ──
+    // This fires after OnboardingPage calls refreshSession(). The new JWT has
+    // onboarding_complete=true, AuthContext re-hydrates and sets loading=false,
+    // then this rule fires and completes the navigation to the dashboard.
+    // Without this rule the user was permanently stuck on /onboarding because
+    // AuthRedirect had no path to navigate *away* from it once complete.
+    if (path === '/onboarding' && tenant?.slug && isOnboardingComplete()) {
+      navigate('/', { replace: true })
+      return
+    }
+
   }, [isAuthenticated, isOnboardingComplete, loading, tenant, location.pathname, navigate])
 
   return null

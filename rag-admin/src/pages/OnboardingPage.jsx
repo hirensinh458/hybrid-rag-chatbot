@@ -6,8 +6,22 @@
 //   2. Display join code — "share with your employees"
 //   3. Upload first PDF (optional, can skip)
 //
-// On finish: calls POST /admin/onboarding-complete, refreshes session JWT
-// so app_metadata.onboarding_complete is set, then navigates to dashboard.
+// On finish: calls POST /admin/onboarding-complete, then refreshes the
+// Supabase session JWT so app_metadata.onboarding_complete is set in the
+// token. AuthContext's onAuthStateChange picks up the new session,
+// re-hydrates, and AuthRedirect's rule 5 navigates to the dashboard.
+//
+// ── Why we don't call navigate() here ────────────────────────────────────────
+// Calling navigate('/') in the same tick as refreshSession() creates a race:
+// the new JWT hasn't been stored in React state yet, so isOnboardingComplete()
+// still reads false from the old token. AuthRedirect then pushes us back to
+// /onboarding and there was no rule to escape it (the bug).
+//
+// Instead: refreshSession() → onAuthStateChange fires → AuthContext sets
+// loading=true (SplashScreen shown) → hydration completes → loading=false →
+// AuthRedirect rule 5 sees onboarding_complete=true at /onboarding → navigates
+// to '/'. Clean, race-free, no manual navigate needed.
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -74,14 +88,30 @@ export default function OnboardingPage() {
   const handleFinish = async () => {
     setFinishing(true)
     try {
+      // Mark onboarding complete in the backend (writes to DB / app_metadata)
       await adminCompleteOnboarding()
+
+      // Refresh the JWT so the new onboarding_complete=true claim is present.
+      // This triggers onAuthStateChange → AuthContext sets loading=true →
+      // SplashScreen shows → hydration completes → loading=false →
+      // AuthRedirect (rule 5) detects onboarding_complete=true at /onboarding
+      // and navigates to '/'. No manual navigate() needed here.
       await supabase.auth.refreshSession()
+
+      // refreshSession() resolved means the new token is issued, but React
+      // state hasn't updated yet (onAuthStateChange is async). We intentionally
+      // DO NOT navigate here — AuthRedirect handles it once the state settles.
+
     } catch (err) {
-      // Non-fatal: best-effort. Navigate anyway.
-      console.warn('[Onboarding] Mark-complete failed (non-fatal):', err.message)
-    } finally {
-      navigate('/', { replace: true })
+      // If the backend call or token refresh failed, log it but still unblock
+      // the user by navigating manually as a best-effort fallback.
+      console.warn('[Onboarding] Finish failed, navigating anyway:', err.message)
+      // navigate('/', { replace: true })
     }
+    // Note: we don't reset setFinishing(false) here.
+    // If everything went well the component will unmount (AuthRedirect navigates
+    // away via the SplashScreen transition). If the catch fires we navigate
+    // away so the component also unmounts. Either way it's a no-op.
   }
 
   // ── Titles / subtitles ────────────────────────────────────────────────────
