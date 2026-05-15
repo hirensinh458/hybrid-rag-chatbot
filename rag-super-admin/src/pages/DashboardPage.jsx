@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { listTenants, getAlerts, getActivity, listPlans } from '../api/superAdmin'
 import { StatusBadge, PlanBadge, UsageMeter, Spinner, RelTime, SectionHeader } from '../components/Shared'
+import { useAuth } from '../context/AuthContext'
 
 function StatCard({ label, value, sub, accent }) {
   return (
@@ -16,12 +17,15 @@ function StatCard({ label, value, sub, accent }) {
 
 export default function DashboardPage() {
   const navigate = useNavigate()
+  const { session } = useAuth()
   const [tenants,  setTenants]  = useState([])
   const [alerts,   setAlerts]   = useState([])
   const [activity, setActivity] = useState([])
   const [loading,  setLoading]  = useState(true)
 
   useEffect(() => {
+    if (!session) return
+
     async function load() {
       try {
         const [t, a, act] = await Promise.all([
@@ -36,7 +40,7 @@ export default function DashboardPage() {
       setLoading(false)
     }
     load()
-  }, [])
+  }, [session])
 
   if (loading) return <Spinner text="Loading dashboard…" />
 

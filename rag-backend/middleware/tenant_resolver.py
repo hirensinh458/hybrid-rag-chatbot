@@ -2,8 +2,23 @@
 #
 # Phase 1 — Multi-Tenancy Foundation  (original)
 # Phase 3 — Plan & Usage Enforcement  (extended)
+# Phase 5 — Super Admin bypass        (this patch)
 #
-# PHASE 3 CHANGES vs Phase 1:
+# PHASE 5 CHANGES vs Phase 3:
+#   - resolve_tenant() now short-circuits for super_admin users.
+#     Super admins have no tenant_id in their JWT (by design — they are
+#     cross-tenant operators, not members of any tenant).
+#     Without this bypass they would receive a 401 on every request
+#     because the `if not tenant_id` guard fired before the role was checked.
+#
+#   NEW BEHAVIOUR for super_admin:
+#     - JWT is decoded and role == "super_admin" is confirmed.
+#     - request.state is populated with safe null values for tenant fields.
+#     - The Supabase tenant DB lookup is SKIPPED entirely (no I/O cost).
+#     - Control returns immediately; require_super_admin (super_admin_auth.py)
+#       then runs its IP allowlist check, role assertion, and audit log write.
+#
+# PHASE 3 CHANGES vs Phase 1 (unchanged here):
 #   - require_active_subscription() extended to handle "over_quota" status.
 #     Previously it only blocked "suspended" tenants.
 #
@@ -14,12 +29,13 @@
 #       X-Quota-Warning: over_quota header to the response.
 #     - The mobile app reads this header and shows a dismissible banner.
 #
-# ALL OTHER CODE IS UNCHANGED from Phase 1.
+# ALL OTHER CODE IS UNCHANGED from Phase 3.
 #
 # Dependency chain for protected routes:
-#   resolve_tenant           → validates JWT, populates request.state
-#   require_admin_role       → chains after resolve_tenant; gates admin routes
-#   require_active_subscription → chains after resolve_tenant; gates chat/query routes
+#   resolve_tenant               → validates JWT, populates request.state
+#   require_admin_role           → chains after resolve_tenant; gates admin routes
+#   require_active_subscription  → chains after resolve_tenant; gates chat/query routes
+#   require_super_admin          → wraps resolve_tenant; gates /super-admin/* routes
 
 from __future__ import annotations
 
@@ -66,20 +82,28 @@ async def resolve_tenant(request: Request) -> None:
     FastAPI dependency — validates the Supabase JWT and populates request.state
     with tenant context for downstream handlers.
 
-    Sets on request.state:
-        tenant_id   : str  — UUID of the tenant
-        tenant_slug : str  — URL-safe slug e.g. "acme_shipping"
+    Sets on request.state (all users):
         role        : str  — "admin" | "user" | "super_admin"
-        tenant      : dict — full tenants row (including joined plan)
-        plan        : dict — joined plans row
         user_id     : str  — Supabase auth.users UUID (sub claim)
         user_email  : str  — user's email (for audit logging)
-        quota_warning: bool — False by default; set True by require_active_subscription
-                              when tenant status is "over_quota"
+        quota_warning: bool — always False for super_admin
+
+    Sets on request.state (tenant users only — admin / user):
+        tenant_id   : str  — UUID of the tenant
+        tenant_slug : str  — URL-safe slug e.g. "acme_shipping"
+        tenant      : dict — full tenants row (including joined plan)
+        plan        : dict — joined plans row
+
+    Sets on request.state (super_admin only):
+        tenant_id   : None  — super admin has no tenant
+        tenant_slug : None  — super admin has no tenant
+        tenant      : {}    — empty; super admin routes never read this
+        plan        : {}    — empty; super admin routes never read this
 
     Raises:
-        401 — missing token, invalid token, no tenant context in JWT claims.
-        403 — tenant is not found in the database.
+        401 — missing token, invalid token, no tenant context in JWT claims
+              (unless the user is a super_admin, who legitimately has no tenant).
+        503 — Supabase tenant lookup failed transiently.
     """
     credentials: HTTPAuthorizationCredentials | None = await _bearer(request)
     if not credentials:
@@ -105,6 +129,45 @@ async def resolve_tenant(request: Request) -> None:
     tenant_id = app_meta.get("tenant_id")
     role      = app_meta.get("role", "user")
 
+    # ── Super admin bypass ────────────────────────────────────────────────────
+    #
+    # Super admins are provisioned directly in Supabase Dashboard with
+    # raw_app_meta_data = {"role": "super_admin"}. They are NOT in the
+    # tenant_members table, so the custom_access_token_hook SQL function
+    # intentionally produces a JWT with NO tenant_id.
+    #
+    # Without this bypass, the `if not tenant_id` guard below would reject
+    # every super admin request with a 401 before the role was ever checked.
+    #
+    # We verify BOTH conditions before bypassing:
+    #   1. role == "super_admin"   — confirmed from JWT app_metadata
+    #   2. not tenant_id           — confirms they are NOT accidentally also
+    #                                a tenant member (belt-and-suspenders)
+    #
+    # After this block, require_super_admin (super_admin_auth.py) runs
+    # its own IP allowlist check, role assertion, and audit log write.
+    # ─────────────────────────────────────────────────────────────────────────
+    if role == "super_admin" and not tenant_id:
+        request.state.tenant_id    = None
+        request.state.tenant_slug  = None
+        request.state.role         = "super_admin"
+        request.state.tenant       = {}
+        request.state.plan         = {}
+        request.state.user_id      = payload.get("sub")
+        request.state.user_email   = payload.get("email", "")
+        request.state.quota_warning = False
+        logger.debug(
+            "[TENANT_RESOLVER] Super admin bypass — user=%s  no tenant context (expected)",
+            payload.get("email", "unknown"),
+        )
+        return  # skip Supabase tenant lookup entirely
+
+    # ── Ordinary tenant user guard ────────────────────────────────────────────
+    #
+    # Any non-super-admin user must have a tenant_id in their JWT.
+    # If it's missing, their membership row is absent or the hook hasn't fired
+    # yet — tell them to sign in again so a fresh JWT is issued.
+    # ─────────────────────────────────────────────────────────────────────────
     if not tenant_id:
         raise HTTPException(
             status_code=401,

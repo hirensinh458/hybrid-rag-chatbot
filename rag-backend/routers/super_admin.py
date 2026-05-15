@@ -802,6 +802,22 @@ async def remove_member(tenant_id: str, user_id: str, request: Request):
 
         sb.table("tenant_members").delete().eq("tenant_id", tenant_id).eq("user_id", user_id).execute()
 
+        # Invalidate the user's active sessions immediately so their existing
+        # JWT stops working right now, not after it naturally expires (~1 hour).
+        # This also clears tenant_id and role from their app_metadata so the
+        # next login gets a clean token with no stale claims.
+        try:
+            sb.auth.admin.update_user_by_id(
+                user_id,
+                {"app_metadata": {"tenant_id": None, "role": None}},
+            )
+            sb.auth.admin.sign_out(user_id, scope="global")
+        except Exception as exc:
+            logger.warning(
+                "[SUPER_ADMIN] Could not invalidate session for user=%s: %s",
+                user_id, exc,
+            )
+
         # Decrement user count (floor at 0)
         current_usage = (
             sb.table("tenant_usage")
@@ -850,7 +866,7 @@ async def promote_member(
     The Supabase custom-claims hook fires on the user's next sign-in, so their
     JWT will carry the new role after they log in again.
     """
-    valid_roles = {"user", "admin", "super_admin"}
+    valid_roles = {"user", "admin"}
     if body.role not in valid_roles:
         raise HTTPException(
             status_code=400,
@@ -871,6 +887,20 @@ async def promote_member(
         if not existing:
             return None
         sb.table("tenant_members").update({"role": body.role}).eq("tenant_id", tenant_id).eq("user_id", user_id).execute()
+
+        # Push the new role into app_metadata immediately so the user's next
+        # JWT (on any new request/refresh) carries the updated role without
+        # requiring a full logout → login cycle.
+        try:
+            sb.auth.admin.update_user_by_id(
+                user_id,
+                {"app_metadata": {"role": body.role}},
+            )
+        except Exception as exc:
+            logger.warning(
+                "[SUPER_ADMIN] Could not update app_metadata for user=%s: %s",
+                user_id, exc,
+            )
         return existing
 
     existing = await run_in_threadpool(_promote)

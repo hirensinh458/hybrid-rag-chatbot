@@ -1,10 +1,46 @@
 // api/superAdmin.js
 // All calls to /super-admin/* backend endpoints.
 // Automatically injects the Supabase JWT from session storage.
+//
+// ── FIX: BASE changed from absolute URL to empty string ──────────────────────
+//
+// BEFORE (broken):
+//   const BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+//
+//   This built URLs like:
+//     http://localhost:8000/super-admin/plans
+//
+//   The browser sees a cross-origin request (port 5175 → port 8000) and fires
+//   a CORS preflight. FastAPI's CORSMiddleware is set to allow_origins=["*"]
+//   BUT allow_credentials=False, which means the JWT Authorization header is
+//   stripped — the request arrives with no token and FastAPI returns 500/401.
+//   The Vite proxy in vite.config.js is COMPLETELY BYPASSED because the fetch
+//   uses an absolute URL with a hostname — Vite only intercepts relative paths.
+//
+// AFTER (fixed):
+//   const BASE = ''
+//
+//   This builds URLs like:
+//     /super-admin/plans
+//
+//   The browser sends this to the SAME origin (http://localhost:5175).
+//   Vite's dev server intercepts it (because vite.config.js has the proxy rule:
+//     '/super-admin' → 'http://localhost:8000'
+//   ) and forwards it server-side to FastAPI — no CORS, no preflight, JWT intact.
+//
+// PRODUCTION NOTE:
+//   In production you serve the built React files from a real server/CDN and
+//   configure that server to reverse-proxy /super-admin → your backend.
+//   The relative BASE path works there too — the browser sends /super-admin/*
+//   to the same origin as the page, and your nginx/caddy/etc. proxies it on.
+//   VITE_API_BASE should be left UNSET (or set to '') in your .env.production.
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { supabase } from '../supabase'
 
-const BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+// Empty string → all fetches use relative paths → Vite proxy intercepts them.
+// Do NOT set this to 'http://localhost:8000' — that bypasses the proxy entirely.
+const BASE = ''
 
 async function authHeaders() {
   const { data: { session } } = await supabase.auth.getSession()
