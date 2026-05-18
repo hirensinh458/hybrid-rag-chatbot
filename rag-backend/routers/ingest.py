@@ -77,60 +77,80 @@ router = APIRouter(
 )
 
 
-# ── Hash registry ─────────────────────────────────────────────────────────────
-
-_HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
-
 # ── PDFs directory ────────────────────────────────────────────────────────────
 
 _PDFS_DIR = Path(PDFS_DIR)
+_DATA_DIR = Path(settings.qdrant_path).parent
 
 
-def _load_hashes() -> dict:
-    if _HASH_FILE.exists():
+def _hash_file_path(tenant_slug: str | None) -> Path:
+    """Return the per-tenant hash registry path."""
+    if tenant_slug:
+        return _DATA_DIR / f"file_hashes_{tenant_slug}.json"
+    return _DATA_DIR / "file_hashes.json"   # legacy / dev fallback
+
+
+def _load_hashes(tenant_slug: str | None = None) -> dict:
+    path = _hash_file_path(tenant_slug)
+    if path.exists():
         try:
-            return json.loads(_HASH_FILE.read_text())
+            return json.loads(path.read_text())
         except Exception:
             return {}
     return {}
 
 
-def _save_hashes(hashes: dict) -> None:
-    _HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _HASH_FILE.write_text(json.dumps(hashes, indent=2))
+def _save_hashes(hashes: dict, tenant_slug: str | None = None) -> None:
+    path = _hash_file_path(tenant_slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(hashes, indent=2))
 
 
-def _wipe_hashes() -> None:
-    if _HASH_FILE.exists():
-        _HASH_FILE.unlink()
+def _wipe_hashes(tenant_slug: str | None = None) -> None:
+    path = _hash_file_path(tenant_slug)
+    if path.exists():
+        path.unlink()
 
 
-def _remove_hash_for_file(filename: str) -> None:
-    hashes  = _load_hashes()
+def _remove_hash_for_file(filename: str, tenant_slug: str | None = None) -> None:
+    hashes  = _load_hashes(tenant_slug)
     updated = {h: f for h, f in hashes.items() if f != filename}
-    _save_hashes(updated)
+    _save_hashes(updated, tenant_slug)
 
 
 # ── PDF file management ───────────────────────────────────────────────────────
 
-def _store_pdf_file(tmp_path: str, filename: str) -> Path | None:
-    _PDFS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = _PDFS_DIR / filename
+def _tenant_pdfs_dir(tenant_slug: str | None) -> Path:
+    if tenant_slug:
+        return _PDFS_DIR / tenant_slug
+    return _PDFS_DIR   # legacy / dev fallback
+
+
+def _store_pdf_file(tmp_path: str, filename: str, tenant_slug: str | None = None) -> Path | None:
+    dest_dir = _tenant_pdfs_dir(tenant_slug)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
     try:
         shutil.copy2(tmp_path, dest)
-        logger.info("[INGEST] PDF stored for viewer: data/pdfs/%s", filename)
+        logger.info(
+            "[INGEST] PDF stored for viewer: data/pdfs/%s/%s",
+            tenant_slug or "(global)", filename,
+        )
         return dest
     except Exception as e:
         logger.warning("[INGEST] Could not store PDF for viewer: %s", e)
         return None
 
 
-def _delete_pdf_file(filename: str) -> None:
-    pdf_path = _PDFS_DIR / filename
+def _delete_pdf_file(filename: str, tenant_slug: str | None = None) -> None:
+    pdf_path = _tenant_pdfs_dir(tenant_slug) / filename
     if pdf_path.exists():
         try:
             pdf_path.unlink()
-            logger.info("[INGEST] PDF deleted from viewer store: data/pdfs/%s", filename)
+            logger.info(
+                "[INGEST] PDF deleted from viewer store: data/pdfs/%s/%s",
+                tenant_slug or "(global)", filename,
+            )
         except Exception as e:
             logger.warning("[INGEST] Could not delete PDF from viewer store: %s", e)
 
@@ -203,7 +223,7 @@ def _ingest_files_sync(
         bm25_store   = rag_service.get_bm25_store()
         logger.info("[INGEST] Using global stores (single-tenant / dev mode)")
 
-    hashes       = _load_hashes()
+    hashes       = _load_hashes(tenant_slug)
     chunker      = _svc.get_chunker()
 
     files_indexed : list[str] = []
@@ -211,8 +231,8 @@ def _ingest_files_sync(
     all_children  : list[dict] = []
     file_chunks   : dict[str, int] = {}
 
-    # Save original PDFs for viewer (early pass — keeps existing behaviour)
-    pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
+    # Save original PDFs for viewer (early pass — tenant-scoped)
+    pdfs_dir = _tenant_pdfs_dir(tenant_slug)
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for tmp_path_str, filename in file_paths:
         tmp_path = Path(tmp_path_str)
@@ -233,8 +253,8 @@ def _ingest_files_sync(
             )
             vector_store.delete_by_source(filename)
             bm25_store.delete_by_source(filename)
-            _remove_hash_for_file(filename)
-            hashes = _load_hashes()
+            _remove_hash_for_file(filename, tenant_slug)
+            hashes = _load_hashes(tenant_slug)
             logger.info("[INGEST] Old data cleared for '%s' — re-indexing fresh", filename)
 
         # ── 2. Duplicate check (within THIS batch only) ───────────────────────
@@ -314,14 +334,14 @@ def _ingest_files_sync(
 
         # ── 7. Copy PDF to local viewer store ─────────────────────────────────
         if Path(filename).suffix.lower() == ".pdf":
-            _store_pdf_file(tmp_path, filename)
+            _store_pdf_file(tmp_path, filename, tenant_slug)
 
     # ── 8. Index all new chunks ───────────────────────────────────────────────
     if all_children:
         vector_store.add_documents(all_children)
         bm25_store.add(all_children)
 
-    _save_hashes(hashes)
+    _save_hashes(hashes, tenant_slug)
 
     logger.info(
         "[INGEST] Complete — tenant=%s  indexed=%s  chunks=%d  skipped=%s",
@@ -402,8 +422,26 @@ async def ingest(request: Request, files: list[UploadFile] = File(...)):
             detail={"code": "over_quota", "message": err},
         )
 
-    # ── Phase 2: Save PDFs for the viewer ─────────────────
-    pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
+    # ── GUARD: Block upload if tenant is already over_quota ───────────────
+    tenant_status = request.state.tenant.get("status")
+    if tenant_status == "over_quota":
+        logger.warning(
+            "[INGEST] Upload blocked — tenant=%s is over_quota",
+            tenant_slug,
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code"   : "over_quota",
+                "message": (
+                    "Your organization has exceeded its vector limit. "
+                    "Delete documents or contact your admin to upgrade your plan."
+                ),
+            },
+        )
+
+    # ── Phase 2: Save PDFs for the viewer (tenant-scoped) ─
+    pdfs_dir = _tenant_pdfs_dir(tenant_slug)
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for file in files:
         if file.filename.lower().endswith(".pdf"):
@@ -591,8 +629,8 @@ async def delete_file(request: Request, filename: str):
     except Exception as exc:
         logger.warning("[INGEST/DELETE] Cloud cleanup skipped: %s", exc)
 
-    _remove_hash_for_file(filename)
-    _delete_pdf_file(filename)
+    _remove_hash_for_file(filename, tenant_slug)
+    _delete_pdf_file(filename, tenant_slug)
 
     # ── PHASE 3: POST-DELETION — Decrement vector count ───
     if chunk_count > 0:
@@ -661,11 +699,11 @@ async def ingest_status(task_id: str):
 @router.post("/ingest/sync")
 async def trigger_sync(request: Request):
     """
-    Manually trigger a Cloud→Local sync.
-    Called automatically by NetworkMonitor when internet is detected.
-
-    Note: This route intentionally does NOT require auth — it is called by
-    internal services (network monitor, mobile app reconnect logic).
+    Manually trigger a Cloud→Local sync for the requesting tenant.
+    Requires a valid admin JWT — called by the admin panel when the
+    admin wants to force a manual sync.
+    The router-level dependencies (resolve_tenant + require_admin_role)
+    already enforce this.
     """
     from services.sync_service import SyncService
     import asyncio
@@ -680,3 +718,6 @@ async def trigger_sync(request: Request):
 
 __all__ = ["router", "_ingest_files_sync", "_store_pdf_file", "_delete_pdf_file",
            "_remove_hash_for_file", "_wipe_hashes"]
+
+
+================================================

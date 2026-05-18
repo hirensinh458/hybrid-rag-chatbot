@@ -5,7 +5,7 @@ import time
 import asyncio
 import hashlib
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, JSONResponse
 from schemas import (
@@ -13,6 +13,8 @@ from schemas import (
     StatsResponse, WipeResponse,
 )
 from services        import rag_service
+from services.rag_service import get_tenant_stores
+from middleware.tenant_resolver import resolve_tenant, require_admin_role
 from config          import settings
 from datetime        import datetime, timezone
 from utils.logger    import get_logger
@@ -21,13 +23,22 @@ from vectorstore.qdrant_store import _content_hash
 
 logger = get_logger(__name__)
 
+# /health stays public (no auth) — mobile app probes this without a token.
+# All other routes require a valid JWT via the authenticated sub-router below.
 router = APIRouter(tags=["kb"])
 
-# Module-level caches — defined here, imported by ingest.py via local import
-_vec_cache: dict = {}
+# Authenticated router — all data endpoints require a valid tenant JWT.
+_auth_router = APIRouter(
+    tags         = ["kb"],
+    dependencies = [Depends(resolve_tenant)],
+)
+
+# Module-level caches — keyed by (tenant_slug, etag) to prevent cross-tenant pollution
+# These dicts are imported by ingest.py when it needs to invalidate after ingestion.
+_vec_cache: dict = {}          # key: (tenant_slug, etag) → id_to_vec dict
 _vec_cache_lock = asyncio.Lock()
 
-_source_hash_cache: dict = {}
+_source_hash_cache: dict = {}  # key: (tenant_slug, etag) → server_hashes dict
 _source_hash_lock = asyncio.Lock()
 
 
@@ -72,7 +83,7 @@ async def health():
 # CHUNK EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/kb/export")
+@_auth_router.get("/kb/export")
 async def export_chunks(
     request: Request,
     include_vectors: bool = Query(default=True),
@@ -80,15 +91,15 @@ async def export_chunks(
     limit: int = Query(default=2000, ge=1, le=3000),
     source: str = Query(default=None),
 ):
+    tenant_slug = request.state.tenant_slug
     logger.info(
-        "[KB/EXPORT] /kb/export — include_vectors=%s  offset=%d  limit=%d  source=%s",
-        include_vectors, offset, limit, source or "(all)",
+        "[KB/EXPORT] /kb/export — tenant=%s  include_vectors=%s  offset=%d  limit=%d  source=%s",
+        tenant_slug, include_vectors, offset, limit, source or "(all)",
     )
     t0 = time.perf_counter()
 
-    vs   = rag_service.get_vector_store()
-    bm25 = rag_service.get_bm25_store()
-    raw  = bm25._chunks
+    vs, bm25 = get_tenant_stores(tenant_slug)
+    raw      = bm25._chunks
 
     if source:
         raw = [c for c in raw if c.get("source", "") == source]
@@ -105,20 +116,23 @@ async def export_chunks(
         return Response(status_code=304, headers={"X-Export-Etag": etag})
 
     id_to_vec: dict = {}
-    print(include_vectors, etag, client_etag)
+    logger.debug(
+        "[KB/EXPORT] include_vectors=%s  etag=%s...  client_etag=%s...",
+        include_vectors, etag[:8], client_etag[:8] if client_etag else "(none)",
+    )
     if include_vectors:
-        print("DEBUG: include_vectors=True, fetching vectors for export...")
+        cache_key = (tenant_slug, etag)
         async with _vec_cache_lock:
-            if _vec_cache.get("etag") == etag:
+            if _vec_cache.get("key") == cache_key:
                 id_to_vec = _vec_cache["data"]
                 logger.debug(
-                    "[KB/EXPORT] Vector cache HIT (etag=%s...)  %d vectors",
-                    etag[:8], len(id_to_vec),
+                    "[KB/EXPORT] Vector cache HIT — tenant=%s  etag=%s...  %d vectors",
+                    tenant_slug, etag[:8], len(id_to_vec),
                 )
             else:
                 logger.info(
-                    "[KB/EXPORT] Vector cache MISS (etag=%s...) — scrolling Qdrant",
-                    etag[:8],
+                    "[KB/EXPORT] Vector cache MISS — tenant=%s  etag=%s...",
+                    tenant_slug, etag[:8],
                 )
                 t_v = time.perf_counter()
                 id_to_vec = await run_in_threadpool(vs.get_vectors_for_export)
@@ -126,7 +140,7 @@ async def export_chunks(
                     "[KB/EXPORT] Qdrant scroll done in %.0f ms — %d vectors",
                     (time.perf_counter() - t_v) * 1000, len(id_to_vec),
                 )
-                _vec_cache["etag"] = etag
+                _vec_cache["key"]  = cache_key
                 _vec_cache["data"] = id_to_vec
 
     chunks  = []
@@ -194,28 +208,29 @@ async def export_chunks(
 # DIFF
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("/kb/diff")
+@_auth_router.post("/kb/diff")
 async def kb_diff(request: Request):
     body = await request.json()
     client_hashes: dict = body.get("sources", {})
 
-    vs   = rag_service.get_vector_store()
-    bm25 = rag_service.get_bm25_store()
-    raw  = bm25._chunks
+    tenant_slug = request.state.tenant_slug
+    vs, bm25    = get_tenant_stores(tenant_slug)
+    raw         = bm25._chunks
 
-    etag = await run_in_threadpool(vs.get_export_etag)
+    etag      = await run_in_threadpool(vs.get_export_etag)
+    cache_key = (tenant_slug, etag)
 
     async with _source_hash_lock:
-        if _source_hash_cache.get("etag") == etag:
+        if _source_hash_cache.get("key") == cache_key:
             server_hashes = _source_hash_cache["data"]
             logger.debug(
-                "[KB/DIFF] Source hash cache HIT (etag=%s...)  %d sources",
-                etag[:8], len(server_hashes),
+                "[KB/DIFF] Source hash cache HIT — tenant=%s  etag=%s...",
+                tenant_slug, etag[:8],
             )
         else:
             logger.info(
-                "[KB/DIFF] Source hash cache MISS (etag=%s...) — computing",
-                etag[:8],
+                "[KB/DIFF] Source hash cache MISS — tenant=%s  etag=%s...",
+                tenant_slug, etag[:8],
             )
             t0 = time.perf_counter()
 
@@ -232,12 +247,12 @@ async def kb_diff(request: Request):
                 combined = "|".join(per_chunk)
                 server_hashes[src] = hashlib.md5(combined.encode()).hexdigest()
 
-            _source_hash_cache["etag"] = etag
+            _source_hash_cache["key"]  = cache_key
             _source_hash_cache["data"] = server_hashes
 
             logger.info(
-                "[KB/DIFF] Source hashes computed in %.0f ms — %d sources",
-                (time.perf_counter() - t0) * 1000, len(server_hashes),
+                "[KB/DIFF] Source hashes computed in %.0f ms — tenant=%s  %d sources",
+                (time.perf_counter() - t0) * 1000, tenant_slug, len(server_hashes),
             )
 
     server_sources = set(server_hashes.keys())
@@ -270,10 +285,11 @@ async def kb_diff(request: Request):
 # EXISTING ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/stats", response_model=StatsResponse)
-async def stats():
-    vs   = rag_service.get_vector_store()
-    bm25 = rag_service.get_bm25_store()
+@_auth_router.get("/stats", response_model=StatsResponse)
+async def stats(request: Request):
+    tenant_slug = request.state.tenant_slug
+    vs, bm25    = get_tenant_stores(tenant_slug)
+    logger.debug("[KB/STATS] Stats polled — tenant=%s", tenant_slug)
 
     vector_count = vs.count()
     bm25_count   = len(bm25)
@@ -297,37 +313,49 @@ async def stats():
     )
 
 
-@router.get("/documents", response_model=DocumentsResponse)
-async def documents():
-    files = rag_service.get_vector_store().list_sources()
-    logger.debug("[KB/DOCUMENTS] Documents list — %d files indexed", len(files))
+@_auth_router.get("/documents", response_model=DocumentsResponse)
+async def documents(request: Request):
+    tenant_slug = request.state.tenant_slug
+    vs, _bm25   = get_tenant_stores(tenant_slug)
+    files       = vs.list_sources()
+    logger.debug(
+        "[KB/DOCUMENTS] Documents list — tenant=%s  %d files indexed",
+        tenant_slug, len(files),
+    )
     return DocumentsResponse(files=files, total_files=len(files))
 
 
-@router.delete("/collection", response_model=WipeResponse)
-async def wipe():
-    """Wipe the entire knowledge base."""
+@_auth_router.delete(
+    "/collection",
+    response_model = WipeResponse,
+    dependencies   = [Depends(require_admin_role)],
+)
+async def wipe(request: Request):
+    """Wipe the calling tenant's entire knowledge base. Admin role required."""
+    tenant_slug = request.state.tenant_slug
     logger.warning(
-        "[KB/COLLECTION] ⚠ WIPE requested — deleting ALL vectors, BM25 index, "
-        "and hash registry. This is irreversible!"
+        "[KB/COLLECTION] ⚠ WIPE requested — tenant=%s  "
+        "deleting ALL vectors, BM25 index, and hash registry. Irreversible!",
+        tenant_slug,
     )
     from routers.ingest import _wipe_hashes   # local import — avoids circular dep
-    rag_service.get_vector_store().reset_collection()
-    rag_service.get_bm25_store().reset()
-    _wipe_hashes()
+    vs, bm25 = get_tenant_stores(tenant_slug)
+    vs.reset_collection()
+    bm25.reset()
+    _wipe_hashes(tenant_slug)
     _vec_cache.clear()
     _source_hash_cache.clear()
-    logger.info("[KB/COLLECTION] ✅ Knowledge base wiped")
+    logger.info("[KB/COLLECTION] ✅ Knowledge base wiped — tenant=%s", tenant_slug)
     return WipeResponse(status="ok", message="Knowledge base wiped.")
 
 
-@router.get("/kb/debug-hash")
-async def debug_hash():
+@_auth_router.get("/kb/debug-hash")
+async def debug_hash(request: Request):
+    tenant_slug = request.state.tenant_slug
     logger.warning(
-        "[KB/DEBUG] /kb/debug-hash called — diagnostic endpoint, remove before production"
+        "[KB/DEBUG] /kb/debug-hash called — tenant=%s  diagnostic endpoint", tenant_slug
     )
-    vs   = rag_service.get_vector_store()
-    bm25 = rag_service.get_bm25_store()
+    vs, bm25 = get_tenant_stores(tenant_slug)
     raw  = bm25._chunks
 
     qdrant_map = await run_in_threadpool(vs.get_vectors_for_export)
@@ -367,3 +395,8 @@ async def debug_hash():
         "bm25_samples":            bm25_samples,
         "qdrant_samples":          qdrant_samples,
     }
+
+
+# Register authenticated routes onto the public router so main.py only
+# needs to include one router object.
+router.include_router(_auth_router)

@@ -380,14 +380,14 @@ class PlanService:
             vector_count = usage.get("vector_count", 0)
             max_vectors  = plan.get("max_vectors", 0)
 
-            if vector_count > max_vectors and current_status == "active":
+            if vector_count > max_vectors and current_status not in ("suspended", "over_quota"):
                 self.sb.table("tenants").update(
                     {"status": "over_quota"}
                 ).eq("id", tenant_id).execute()
                 logger.warning(
                     "[PLAN] Tenant %s transitioned to over_quota "
-                    "(vectors=%d > limit=%d)",
-                    tenant_id, vector_count, max_vectors,
+                    "(vectors=%d > limit=%d  was_status=%s)",
+                    tenant_id, vector_count, max_vectors, current_status,
                 )
 
             elif vector_count <= max_vectors and current_status == "over_quota":
@@ -408,3 +408,6 @@ class PlanService:
 
 
 __all__ = ["PlanService"]
+
+
+================================================
