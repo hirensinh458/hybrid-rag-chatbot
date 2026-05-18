@@ -129,6 +129,8 @@ async def resolve_tenant(request: Request) -> None:
     tenant_id = app_meta.get("tenant_id")
     role      = app_meta.get("role", "user")
 
+    logger.debug("[TENANT_RESOLVER] Full JWT payload: %s", payload)
+
     # ── Super admin bypass ────────────────────────────────────────────────────
     #
     # Super admins are provisioned directly in Supabase Dashboard with

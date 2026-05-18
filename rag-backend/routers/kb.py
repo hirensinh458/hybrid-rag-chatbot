@@ -101,6 +101,23 @@ async def export_chunks(
     vs, bm25 = get_tenant_stores(tenant_slug)
     raw      = bm25._chunks
 
+    # Deduplicate by chunk ID — BM25 stores both child and parent chunks,
+    # and child/parent pairs with the same source+page+content[:80] get
+    # identical hash IDs. Exporting both causes UNIQUE constraint failures
+    # on the mobile vec0 table.
+    seen_ids: set = set()
+    deduped: list = []
+    for c in raw:
+        chunk_id = _content_hash(
+            c.get("source", ""),
+            c.get("page", 0),
+            c.get("content", ""),
+        )
+        if chunk_id not in seen_ids:
+            seen_ids.add(chunk_id)
+            deduped.append(c)
+    raw = deduped
+
     if source:
         raw = [c for c in raw if c.get("source", "") == source]
 

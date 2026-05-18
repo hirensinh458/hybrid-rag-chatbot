@@ -25,7 +25,7 @@ import string
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, EmailStr
 
-from services.supabase_client import get_supabase_admin
+from services.supabase_client import get_supabase_admin, get_supabase_auth
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -302,7 +302,7 @@ async def admin_login(body: AdminLoginRequest):
     The JWT's app_metadata carries tenant_id + role injected by the
     custom claims Edge Function hook on every sign-in.
     """
-    sb = get_supabase_admin()
+    sb = get_supabase_auth()
 
     try:
         auth_response = sb.auth.sign_in_with_password(
@@ -339,6 +339,7 @@ async def mobile_signup(body: MobileSignupRequest):
       7. Return session (access_token + refresh_token).
     """
     sb = get_supabase_admin()
+    sb_auth = get_supabase_auth()
 
     # ── 1. Look up tenant by join_code ────────────────────────────────────────
     tenant_result = (
@@ -471,7 +472,7 @@ async def mobile_signup(body: MobileSignupRequest):
     # tenant_id + role into app_metadata. We must sign in here (not just
     # return the user object) to get a JWT with the correct claims.
     try:
-        sign_in_response = sb.auth.sign_in_with_password(
+        sign_in_response = sb_auth.auth.sign_in_with_password(
             {"email": body.email, "password": body.password}
         )
     except Exception as exc:
@@ -504,7 +505,7 @@ async def mobile_login(body: AdminLoginRequest):  # same fields as admin login
     Identical to admin login — sign_in_with_password + return session.
     The JWT carries tenant context from the custom claims hook.
     """
-    sb = get_supabase_admin()
+    sb = get_supabase_auth()
 
     try:
         auth_response = sb.auth.sign_in_with_password(
@@ -534,7 +535,7 @@ async def refresh_token(body: RefreshRequest):
     Called by clients when their access_token expires (typically after 1 hour).
     The new JWT will have up-to-date claims injected by the custom claims hook.
     """
-    sb = get_supabase_admin()
+    sb = get_supabase_auth()
 
     try:
         auth_response = sb.auth.refresh_session(body.refresh_token)

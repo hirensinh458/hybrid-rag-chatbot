@@ -36,7 +36,6 @@ import json
 import time
 from pathlib import Path
 
-from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -46,7 +45,7 @@ from config import settings
 from utils.logger import get_logger
 
 # Phase 1 — Multi-Tenancy: tenant resolver dependencies
-from fastapi import Depends
+from fastapi import APIRouter, Depends, Request
 from middleware.tenant_resolver import resolve_tenant, require_active_subscription
 from services.rag_service import get_tenant_stores, get_tenant_chain
 
@@ -428,6 +427,13 @@ async def chat_offline(request: Request, req: ChatRequest):
         result.total, elapsed,
     )
     return JSONResponse(content=result.model_dump())
+
+@router.post("/chat/preflight")
+async def chat_preflight(request: Request):
+    """
+    Lightweight pre-flight — JWT + subscription already checked by router-level deps.
+    """
+    return {"ok": True}
 
 
 # ── Session management ────────────────────────────────────────

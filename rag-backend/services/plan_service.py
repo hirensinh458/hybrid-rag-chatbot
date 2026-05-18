@@ -111,6 +111,27 @@ class PlanService:
             raise RuntimeError(f"Plan not found for tenant: {tenant_id}")
         return plan
 
+    def get_remaining_vectors(self, tenant_id: str) -> int:
+        """
+        Return how many more vectors this tenant can add before hitting their limit.
+
+        Returns:
+            int >= 0. Returns 0 if already at or over the limit.
+            Returns a large sentinel (999_999_999) if usage/plan cannot be read,
+            so callers fail open (same behaviour as check_vector_capacity).
+        """
+        try:
+            usage = self.get_usage(tenant_id)
+            plan  = self.get_plan(tenant_id)
+        except RuntimeError as exc:
+            logger.error("[PLAN] get_remaining_vectors failed: %s", exc)
+            # Fail open — don't block uploads when DB is misconfigured.
+            return 999_999_999
+
+        current = usage.get("vector_count", 0)
+        limit   = plan.get("max_vectors", 0)
+        return max(0, limit - current)
+
     # ── PRE-FLIGHT CHECKS ─────────────────────────────────────────────────────
 
     def check_vector_capacity(
@@ -380,14 +401,14 @@ class PlanService:
             vector_count = usage.get("vector_count", 0)
             max_vectors  = plan.get("max_vectors", 0)
 
-            if vector_count > max_vectors and current_status not in ("suspended", "over_quota"):
+            if vector_count > max_vectors and current_status == "active":
                 self.sb.table("tenants").update(
                     {"status": "over_quota"}
                 ).eq("id", tenant_id).execute()
                 logger.warning(
                     "[PLAN] Tenant %s transitioned to over_quota "
-                    "(vectors=%d > limit=%d  was_status=%s)",
-                    tenant_id, vector_count, max_vectors, current_status,
+                    "(vectors=%d > limit=%d)",
+                    tenant_id, vector_count, max_vectors,
                 )
 
             elif vector_count <= max_vectors and current_status == "over_quota":
