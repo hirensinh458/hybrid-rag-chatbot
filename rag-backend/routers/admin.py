@@ -9,6 +9,16 @@
 #                                             Supabase Storage + DB row + usage decrement
 #     GET    /admin/usage                   — plan usage stats with limits and percentages
 #
+# CHANGES vs Phase 4 initial version (quota enforcement):
+#   admin_ingest now has TWO pre-flight checks (matching routers/ingest.py):
+#     1. check_batch_size  — rejects if file count exceeds plan limit (HTTP 400)
+#     2. quota pre-check   — rejects immediately if already at/over vector limit (HTTP 402)
+#   admin_ingest now passes vector_cap (remaining capacity) to _ingest_files_sync
+#     so ingestion stops at the limit rather than exceeding it mid-batch.
+#   admin_ingest handles the quota_hit / remaining_files result fields and:
+#     - Calls _check_and_update_quota_status to flip tenant to over_quota instantly.
+#     - Returns IngestResponse with status="partial" and the list of skipped files.
+#
 # All Phase 2/3 endpoints are UNCHANGED:
 #     GET    /admin/join-code
 #     POST   /admin/join-code/regenerate
@@ -519,16 +529,90 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
     Upload and index one or more PDFs into the knowledge base.
     Admin only — requires a valid admin JWT.
 
+    Pre-flight checks (Phase 4 addition):
+      1. Batch size — rejects with HTTP 400 if file count exceeds plan limit.
+      2. Quota      — rejects with HTTP 402 if the tenant is already at or over
+                      their vector limit (no point ingesting anything).
+
+    Partial ingestion (Phase 4 addition):
+      If there IS remaining capacity but it is less than what the full batch
+      would consume, _ingest_files_sync is called with vector_cap set to the
+      remaining headroom. Files are indexed until the cap is reached; any files
+      that couldn't be processed are reported in remaining_files and the response
+      status is set to "partial".
+
     Post-flight (after _ingest_files_sync succeeds):
       - Increments tenant_usage.vector_count by actual chunk count.
       - Inserts one row into the documents table per successfully indexed file.
-    Both mirror the accounting done in POST /ingest (ingest.py).
+      - Calls _check_and_update_quota_status to flip tenant to over_quota
+        immediately if the cap was hit mid-batch.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
     tenant_id   = request.state.tenant_id
     tenant_slug = request.state.tenant_slug
+
+    # ── Initialise PlanService (used in both pre-flight and post-flight) ───────
+    supabase = get_supabase_admin()
+    plan_svc = PlanService(supabase)
+
+    # ── PRE-FLIGHT CHECK 1 — Batch size ───────────────────────────────────────
+    # Reject if the number of files exceeds the plan's per-batch PDF limit.
+    ok, err = await run_in_threadpool(
+        plan_svc.check_batch_size, tenant_id, len(files)
+    )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err)
+
+    # ── PRE-FLIGHT CHECK 2 — Hard quota gate ──────────────────────────────────
+    # If the tenant is already AT or OVER their vector limit, block the upload
+    # immediately — there is zero remaining capacity so partial ingestion would
+    # yield nothing useful.
+    try:
+        remaining_capacity = await run_in_threadpool(
+            plan_svc.get_remaining_vectors, tenant_id
+        )
+    except Exception as exc:
+        # get_remaining_vectors already returns a large sentinel on error, but
+        # the run_in_threadpool wrapper could also raise. Fail open so a DB
+        # hiccup doesn't block every admin upload.
+        logger.error(
+            "[ADMIN/INGEST] get_remaining_vectors raised unexpectedly — "
+            "tenant=%s: %s — failing open",
+            tenant_slug, exc,
+        )
+        remaining_capacity = 999_999_999
+
+    if remaining_capacity <= 0:
+        # Fetch the actual limit for a user-friendly error message.
+        try:
+            plan_data   = await run_in_threadpool(plan_svc.get_plan, tenant_id)
+            max_vectors = plan_data.get("max_vectors", 0)
+        except Exception:
+            max_vectors = 0
+
+        logger.warning(
+            "[ADMIN/INGEST] Pre-flight quota block — tenant=%s  "
+            "remaining=%d  limit=%d",
+            tenant_slug, remaining_capacity, max_vectors,
+        )
+        raise HTTPException(
+            status_code = status.HTTP_402_PAYMENT_REQUIRED,
+            detail      = {
+                "code"   : "over_quota",
+                "message": (
+                    f"Vector limit reached. You have 0 vectors remaining "
+                    f"out of {max_vectors:,}. "
+                    "Upgrade your plan or delete documents to continue."
+                ),
+            },
+        )
+
+    logger.info(
+        "[ADMIN/INGEST] Pre-flight OK — tenant=%s  remaining_capacity=%d  files=%d",
+        tenant_slug, remaining_capacity, len(files),
+    )
 
     # ── Capture file sizes NOW — before any .read() calls consume the stream ─
     file_sizes: dict[str, int] = {
@@ -558,22 +642,25 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
             tmp_path.write_bytes(content)
             file_paths.append((str(tmp_path), upload.filename))
 
+        # ── Run ingestion with remaining capacity as a hard cap ───────────────
+        # _ingest_files_sync accepts an optional vector_cap kwarg (Phase 4).
+        # When set it stops indexing once that many chunks have been added,
+        # returning quota_hit=True and remaining_files=[...] for skipped files.
         result = await run_in_threadpool(
-            _ingest_files_sync, file_paths, tenant_slug
+            _ingest_files_sync,
+            file_paths,
+            tenant_slug,
+            remaining_capacity,   # vector_cap positional arg — see routers/ingest.py
         )
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ── POST-FLIGHT: Usage accounting ─────────────────────────────────────────
-    # Mirrors the accounting in POST /ingest (ingest.py Phase 3).
-    # _ingest_files_sync already returns file_chunks (per-file counts) so
-    # no extra Qdrant query is needed.
     actual_chunks  = result["total_chunks"]
     file_chunk_map = result.get("file_chunks", {})
-
-    supabase = get_supabase_admin()
-    plan_svc = PlanService(supabase)
+    quota_hit      = result.get("quota_hit", False)
+    remaining_files = result.get("remaining_files", [])
 
     if actual_chunks > 0:
         try:
@@ -613,22 +700,52 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
                 tenant_slug, filename, exc,
             )
 
+    # ── POST-FLIGHT: Quota status sync ────────────────────────────────────────
+    # If the cap was hit mid-batch, flip the tenant to over_quota immediately
+    # rather than waiting for the nightly reconciliation task.
+    if quota_hit:
+        try:
+            await run_in_threadpool(
+                plan_svc._check_and_update_quota_status, tenant_id
+            )
+            logger.info(
+                "[ADMIN/INGEST] Quota status synced after partial ingest — tenant=%s",
+                tenant_slug,
+            )
+        except Exception as exc:
+            logger.error(
+                "[ADMIN/INGEST] _check_and_update_quota_status failed — tenant=%s: %s",
+                tenant_slug, exc,
+            )
+
     logger.info(
-        "[ADMIN/INGEST] ✅ tenant=%s  files=%s  chunks=%d",
+        "[ADMIN/INGEST] ✅ tenant=%s  files=%s  chunks=%d  quota_hit=%s  skipped_quota=%s",
         tenant_slug,
         result["files_indexed"],
         actual_chunks,
+        quota_hit,
+        remaining_files,
+    )
+
+    # Build a human-readable message that covers both the normal and partial cases.
+    base_msg = (
+        f"Indexed {len(result['files_indexed'])} file(s). "
+        f"Skipped {len(result['skipped'])} duplicate(s)."
+    )
+    quota_msg = (
+        f" Vector quota reached — {len(remaining_files)} file(s) not indexed: "
+        f"{', '.join(remaining_files)}. Upgrade your plan to continue."
+        if quota_hit else ""
     )
 
     return IngestResponse(
-        status        = "ok",
-        files_indexed = result["files_indexed"],
-        total_chunks  = result["total_chunks"],
-        total_parents = result["total_parents"],
-        message       = (
-            f"Indexed {len(result['files_indexed'])} file(s). "
-            f"Skipped {len(result['skipped'])} duplicate(s)."
-        ),
+        status          = "partial" if quota_hit else "ok",
+        files_indexed   = result["files_indexed"],
+        total_chunks    = result["total_chunks"],
+        total_parents   = result["total_parents"],
+        message         = base_msg + quota_msg,
+        quota_hit       = quota_hit,
+        remaining_files = remaining_files,
     )
 
 # ── DELETE /admin/file/{filename} ─────────────────────────────────────────────

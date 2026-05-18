@@ -3,23 +3,21 @@
 #
 # CHANGES vs previous version:
 #   - OfflineChunk: added bbox, page_width, page_height, chunk_type fields.
+#   - IngestResponse: added quota_hit (bool) and remaining_files (list[str]).
 #
-#   WHY:
-#     These four new fields are what the frontend PDF viewer needs to:
-#       1. Navigate to the exact page (page field already existed)
-#       2. Know the coordinate space (page_width, page_height)
-#       3. Draw a highlight rectangle (bbox)
-#       4. Show the right icon in the card header (chunk_type)
+#   WHY (IngestResponse changes):
+#     When a batch upload hits the vector quota mid-flight, the backend now
+#     performs partial ingestion — indexing files until the cap is reached,
+#     then stopping. The two new fields communicate this outcome to callers:
 #
-#     bbox is Optional (list[float] | None) because:
-#       - Text blocks: always populated (PyMuPDF gives exact bbox)
-#       - Table blocks: populated when pdfplumber find_tables() is used
-#       - Image blocks: populated when get_image_rects() succeeds, else None
-#     The frontend must handle None gracefully — it means "go to page, no highlight".
+#       quota_hit      : True when one or more files were skipped because the
+#                        tenant's vector limit was reached during this batch.
+#       remaining_files: Names of files that were NOT indexed due to quota.
+#                        Empty list when quota_hit is False.
 #
-#     chunk_type was already on Citation but missing from OfflineChunk.
-#     Added for consistency so the frontend can render the right icon
-#     (📄 text, ⊞ table, 🖼 image) in offline chunk cards.
+#     The frontend (IngestPanel.jsx) uses these to display a warning banner
+#     identifying exactly which files were skipped, rather than marking the
+#     whole upload as failed.
 
 from pydantic import BaseModel, Field
 
@@ -119,11 +117,14 @@ class SyncStatusResponse(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    status        : str
-    files_indexed : list[str]
-    total_chunks  : int
-    total_parents : int
-    message       : str
+    status          : str                # "ok" | "partial"
+    files_indexed   : list[str]
+    total_chunks    : int
+    total_parents   : int
+    message         : str
+    # ── Phase 4 additions — partial quota ingestion ───────────────────────────
+    quota_hit       : bool       = False  # True when vector cap was reached mid-batch
+    remaining_files : list[str]  = []     # Files NOT indexed because quota was hit
 
 
 class StatsResponse(BaseModel):

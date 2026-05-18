@@ -88,6 +88,8 @@ export function AuthProvider({ children }) {
                 adminGetUsage(),
                 adminGetJoinCode(),
             ])
+            
+            // ── NEW: Preserve the full usageData object so usage.status is available ──
             setUsage(usageData)
             setJoinCode(joinCodeData?.join_code ?? null)
 
@@ -100,6 +102,8 @@ export function AuthProvider({ children }) {
                 name: usageData?.plan ?? '',
                 max_vectors: usageData?.vectors?.limit ?? 0,
                 max_users: usageData?.users?.limit ?? 0,
+                // ── NEW: Expose batch limit so IngestPanel can read plan.max_batch_pdfs ──
+                max_batch_pdfs: usageData?.max_batch_pdfs ?? 3,
             }
         } catch (err) {
             console.warn('[AuthContext] Failed to hydrate tenant data from API:', err.message)
@@ -201,7 +205,30 @@ export function AuthProvider({ children }) {
     const refreshUsage = useCallback(async () => {
         try {
             const usageData = await adminGetUsage()
+            // ── NEW: Preserve full usage object (including status) on refresh ──
             setUsage(usageData)
+            
+            // Also update plan limits if they changed
+            if (usageData) {
+                setPlan(prev => prev ? {
+                    ...prev,
+                    name: usageData.plan ?? prev.name,
+                    max_vectors: usageData.vectors?.limit ?? prev.max_vectors,
+                    max_users: usageData.users?.limit ?? prev.max_users,
+                    max_batch_pdfs: usageData.max_batch_pdfs ?? prev.max_batch_pdfs,
+                } : {
+                    name: usageData.plan ?? '',
+                    max_vectors: usageData.vectors?.limit ?? 0,
+                    max_users: usageData.users?.limit ?? 0,
+                    max_batch_pdfs: usageData.max_batch_pdfs ?? 3,
+                })
+                
+                // Also keep tenant status in sync
+                setTenant(prev => prev ? {
+                    ...prev,
+                    status: usageData.status ?? prev.status,
+                } : prev)
+            }
         } catch { /* non-fatal */ }
     }, [])
 

@@ -95,7 +95,7 @@ function FileRow({ file, status, result, error }) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export default function IngestPanel({ onSuccess, compact = false }) {
-  const { plan, refreshUsage } = useAuth()
+  const { plan, usage, refreshUsage } = useAuth()
 
   const [dragOver,   setDragOver]   = useState(false)
   const [files,      setFiles]      = useState([])      // File[] staged
@@ -109,8 +109,12 @@ export default function IngestPanel({ onSuccess, compact = false }) {
 
   const maxBatch = plan?.max_batch_pdfs ?? 3
 
+  // ── NEW: Quota guard ─────────────────────────────────────────────────────
+  const isOverQuota = usage?.status === 'over_quota'
+
   // ── File validation ────────────────────────────────────────────────────────
   const addFiles = useCallback((incoming) => {
+    if (isOverQuota) return
     const pdfs = [...incoming].filter(f => f.type === 'application/pdf' || f.name.endsWith('.pdf'))
     if (!pdfs.length) return
 
@@ -125,7 +129,7 @@ export default function IngestPanel({ onSuccess, compact = false }) {
       }
       return next
     })
-  }, [maxBatch])
+  }, [maxBatch, isOverQuota])
 
   const removeFile = (name) => {
     setFiles(prev => prev.filter(f => f.name !== name))
@@ -143,18 +147,19 @@ export default function IngestPanel({ onSuccess, compact = false }) {
   }
 
   // ── Drag handlers ──────────────────────────────────────────────────────────
-  const onDragOver  = (e) => { e.preventDefault(); setDragOver(true)  }
-  const onDragLeave = ()  => setDragOver(false)
+  const onDragOver  = (e) => { if (isOverQuota) return; e.preventDefault(); setDragOver(true)  }
+  const onDragLeave = ()  => { if (isOverQuota) return; setDragOver(false) }
   const onDrop = (e) => {
+    if (isOverQuota) return
     e.preventDefault()
     setDragOver(false)
     addFiles(e.dataTransfer.files)
   }
-  const onInputChange = (e) => addFiles(e.target.files)
+  const onInputChange = (e) => { if (isOverQuota) return; addFiles(e.target.files) }
 
   // ── Upload ─────────────────────────────────────────────────────────────────
   const handleUpload = async () => {
-    if (!files.length || uploading) return
+    if (!files.length || uploading || isOverQuota) return
     setUploading(true)
     setGlobalErr(null)
 
@@ -192,6 +197,17 @@ export default function IngestPanel({ onSuccess, compact = false }) {
       setResults(newResults)
       setErrors(newErrors)
 
+      // ── NEW: Handle quota_hit partial response ────────────────────────────
+      if (response?.quota_hit) {
+        const skippedCount = response.remaining_files?.length ?? 0
+        setGlobalErr(
+          `Vector quota reached during upload. ` +
+          `${skippedCount} file(s) were not indexed. ` +
+          `Upgrade your plan to continue.`
+        )
+        await refreshUsage()
+      }
+
       // Refresh usage badge in sidebar
       await refreshUsage()
 
@@ -199,11 +215,25 @@ export default function IngestPanel({ onSuccess, compact = false }) {
       if (onSuccess) onSuccess(response)
 
     } catch (err) {
-      // Mark all as error
-      const errStatuses = {}
-      files.forEach(f => { errStatuses[f.name] = 'error' })
-      setStatuses(errStatuses)
-      setGlobalErr(err.message ?? 'Upload failed. Please try again.')
+      const detail = err?.response?.data?.detail
+
+      // ── NEW: Catch 402 over_quota from pre-flight ─────────────────────────
+      if (
+        (typeof detail === 'object' && detail?.code === 'over_quota') ||
+        err?.response?.status === 402
+      ) {
+        const msg =
+          (typeof detail === 'object' && detail?.message) ||
+          'Vector quota reached. Upgrade your plan to continue.'
+        setGlobalErr(msg)
+        await refreshUsage()
+      } else {
+        // Mark all as error
+        const errStatuses = {}
+        files.forEach(f => { errStatuses[f.name] = 'error' })
+        setStatuses(errStatuses)
+        setGlobalErr(err.message ?? 'Upload failed. Please try again.')
+      }
     } finally {
       setUploading(false)
     }
@@ -212,11 +242,43 @@ export default function IngestPanel({ onSuccess, compact = false }) {
   // ── Derived ────────────────────────────────────────────────────────────────
   const allDone    = files.length > 0 && files.every(f => statuses[f.name] === 'done')
   const hasErrors  = files.some(f => statuses[f.name] === 'error')
-  const canUpload  = files.length > 0 && !uploading && !allDone
+  const canUpload  = files.length > 0 && !uploading && !allDone && !isOverQuota
   const overLimit  = files.length >= maxBatch
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: compact ? 10 : 14 }}>
+
+      {/* ── NEW: Quota banner ──────────────────────────────────────────────── */}
+      {isOverQuota && (
+        <div style={{
+          background: 'var(--danger-bg, #fef2f2)',
+          border: '1px solid var(--danger-border, #fecaca)',
+          borderRadius: 'var(--r-md, 8px)',
+          padding: '12px 16px',
+          fontSize: '.78rem',
+          color: 'var(--danger, #dc2626)',
+          fontFamily: 'var(--font-mono, monospace)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+        }}>
+          <span>🚨</span>
+          <div>
+            <strong>Vector quota reached.</strong> New documents cannot be
+            uploaded. Delete existing documents or{' '}
+            <a
+              href="/plans"
+              style={{
+                color: 'var(--danger, #dc2626)',
+                textDecoration: 'underline',
+              }}
+            >
+              upgrade your plan
+            </a>{' '}
+            to continue.
+          </div>
+        </div>
+      )}
 
       {/* Batch limit hint */}
       {!compact && (
@@ -234,12 +296,13 @@ export default function IngestPanel({ onSuccess, compact = false }) {
 
       {/* Drop zone */}
       <div
-        onDragOver={onDragOver}
-        onDragLeave={onDragLeave}
-        onDrop={onDrop}
-        onClick={() => inputRef.current?.click()}
+        onDragOver={isOverQuota ? undefined : onDragOver}
+        onDragLeave={isOverQuota ? undefined : onDragLeave}
+        onDrop={isOverQuota ? undefined : onDrop}
+        onClick={isOverQuota ? undefined : () => inputRef.current?.click()}
         style={{
           border: `2px dashed ${
+            isOverQuota ? 'var(--border-md)' :
             dragOver   ? 'var(--accent)'      :
             overLimit  ? 'var(--warn-border)' :
             'var(--border-md)'
@@ -248,26 +311,30 @@ export default function IngestPanel({ onSuccess, compact = false }) {
           padding: compact ? '20px 16px' : '28px 20px',
           display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'center', gap: 8,
-          cursor: overLimit ? 'not-allowed' : 'pointer',
-          background: dragOver ? 'var(--accent-glow)' : 'var(--bg-2)',
+          cursor: isOverQuota ? 'not-allowed' : (overLimit ? 'not-allowed' : 'pointer'),
+          background: dragOver && !isOverQuota ? 'var(--accent-glow)' : 'var(--bg-2)',
           transition: 'border-color .15s, background .15s',
           textAlign: 'center',
+          opacity: isOverQuota ? 0.4 : 1,
+          pointerEvents: isOverQuota ? 'none' : 'auto',
         }}
       >
         <span style={{ fontSize: compact ? '1.4rem' : '1.8rem' }}>📥</span>
         <div style={{
           fontSize: compact ? '.75rem' : '.82rem',
-          color: dragOver ? 'var(--accent-text)' : 'var(--text-2)',
+          color: isOverQuota ? 'var(--text-3)' : (dragOver ? 'var(--accent-text)' : 'var(--text-2)'),
           fontFamily: 'var(--font-body)',
           transition: 'color .15s',
         }}>
-          {dragOver
-            ? 'Drop to add files'
-            : overLimit
-              ? `Batch limit reached (${maxBatch} files)`
-              : 'Drag & drop PDFs here, or click to browse'}
+          {isOverQuota
+            ? 'Upload disabled — quota reached'
+            : dragOver
+              ? 'Drop to add files'
+              : overLimit
+                ? `Batch limit reached (${maxBatch} files)`
+                : 'Drag & drop PDFs here, or click to browse'}
         </div>
-        {!compact && (
+        {!compact && !isOverQuota && (
           <div style={{
             fontSize: '.65rem', color: 'var(--text-3)',
             fontFamily: 'var(--font-mono)',
@@ -284,6 +351,7 @@ export default function IngestPanel({ onSuccess, compact = false }) {
         multiple
         onChange={onInputChange}
         style={{ display: 'none' }}
+        disabled={isOverQuota}
       />
 
       {/* File list */}

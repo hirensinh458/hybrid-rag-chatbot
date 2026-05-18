@@ -168,7 +168,8 @@ def _get_loader(tmp_path: str, filename: str):
 
 def _ingest_files_sync(
     file_paths  : list[tuple[str, str]],
-    tenant_slug : str = None,           # Phase 2 — thread tenant scope through ingest
+    tenant_slug : str = None,
+    vector_cap  : int = None,
 ) -> dict:
     """
     Ingest one or more files into the tenant-scoped vector store and BM25 index.
@@ -203,6 +204,8 @@ def _ingest_files_sync(
             "total_chunks"  : int,      ← actual chunk count (for usage accounting)
             "total_parents" : int,
             "file_chunks"   : {filename: int},  ← per-file chunk counts
+            "quota_hit"     : bool,      ← NEW: True if vector_cap was reached
+            "remaining_files": list[str], ← NEW: files not indexed due to quota
         }
     """
     try:
@@ -230,6 +233,11 @@ def _ingest_files_sync(
     skipped       : list[str] = []
     all_children  : list[dict] = []
     file_chunks   : dict[str, int] = {}
+
+    # ── NEW: quota tracking ────────────────────────────────────────────────
+    quota_hit       = False
+    vectors_added   = 0
+    remaining_files = []
 
     # Save original PDFs for viewer (early pass — tenant-scoped)
     pdfs_dir = _tenant_pdfs_dir(tenant_slug)
@@ -296,6 +304,18 @@ def _ingest_files_sync(
         else:
             children = chunker.chunk_documents(blocks)
 
+        # ── NEW: partial quota enforcement ────────────────────────────────
+        if vector_cap is not None:
+            available = vector_cap - vectors_added
+            if available <= 0:
+                remaining_files.append(filename)
+                quota_hit = True
+                continue
+            if len(children) > available:
+                children = children[:available]
+                quota_hit = True
+        # ──────────────────────────────────────────────────────────────────
+
         # ── 5. Upload to Supabase Storage (tenant-scoped path) ────────────────
         # Phase 3: path is now pdfs/{tenant_slug}/{filename}
         source_url = ""
@@ -332,6 +352,9 @@ def _ingest_files_sync(
         file_chunks[filename] = len(children)
         hashes[fhash] = filename
 
+        # ── NEW: track vectors added ─────────────────────────────────────
+        vectors_added += len(children)
+
         # ── 7. Copy PDF to local viewer store ─────────────────────────────────
         if Path(filename).suffix.lower() == ".pdf":
             _store_pdf_file(tmp_path, filename, tenant_slug)
@@ -352,13 +375,14 @@ def _ingest_files_sync(
     )
 
     return {
-        "files_indexed": files_indexed,
-        "skipped"      : skipped,
-        "total_chunks" : len(all_children),
-        "total_parents": len(all_children),
-        "file_chunks"  : file_chunks,   # Phase 3 — per-file counts for document records
+        "files_indexed" : files_indexed,
+        "skipped"       : skipped,
+        "total_chunks"  : len(all_children),
+        "total_parents" : len(all_children),
+        "file_chunks"   : file_chunks,
+        "quota_hit"     : quota_hit,
+        "remaining_files": remaining_files,
     }
-
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
