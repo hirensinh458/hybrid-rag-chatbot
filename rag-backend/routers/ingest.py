@@ -616,18 +616,12 @@ async def delete_file(request: Request, filename: str):
         )
 
     # ── Delete vectors from cloud ─────────────────────────
-    result = await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
+    result = await run_in_threadpool(rag_service.delete_file_from_cloud, filename, tenant_slug)
 
     # Phase 2: Clean up tenant BM25 immediately
     bm25.delete_by_source(filename)
 
-    # Best-effort cloud store cleanup (Phase 2)
-    try:
-        cloud_sources = cloud_store.list_sources()
-        if filename in cloud_sources:
-            await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
-    except Exception as exc:
-        logger.warning("[INGEST/DELETE] Cloud cleanup skipped: %s", exc)
+    # (duplicate delete guard removed — delete_file_from_cloud handles this atomically)
 
     _remove_hash_for_file(filename, tenant_slug)
     _delete_pdf_file(filename, tenant_slug)
@@ -718,6 +712,3 @@ async def trigger_sync(request: Request):
 
 __all__ = ["router", "_ingest_files_sync", "_store_pdf_file", "_delete_pdf_file",
            "_remove_hash_for_file", "_wipe_hashes"]
-
-
-================================================

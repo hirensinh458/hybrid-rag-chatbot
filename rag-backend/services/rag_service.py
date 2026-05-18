@@ -74,6 +74,7 @@ _tasks: dict = {}
 
 _tenant_stores_cloud: dict[str, tuple] = {}
 _tenant_stores_local: dict[str, tuple] = {}
+_tenant_chains:       dict[str, object] = {}  # slug → RAGChain (per-tenant conversation memory)
 
 
 def get_tenant_stores(tenant_slug: str):
@@ -118,6 +119,40 @@ def get_tenant_stores(tenant_slug: str):
         print(f"  [SERVICE] get_tenant_stores('{tenant_slug}', mode='{mode}') — cache hit")
 
     return cache[tenant_slug]
+
+def get_tenant_chain(tenant_slug: str) -> "RAGChain":
+    """
+    Return a RAGChain instance scoped to the given tenant.
+    Each tenant gets its own chain with its own conversation memory,
+    its own retriever wired to the tenant's vector store and BM25 index.
+
+    Cached per-slug in _tenant_chains so repeated requests from the same
+    tenant reuse the same instance (and the same conversation memory).
+    """
+    if tenant_slug not in _tenant_chains:
+        vs, bm25 = get_tenant_stores(tenant_slug)
+
+        retriever = HybridRetriever(
+            vector_store = vs,
+            embedder     = _embedder,
+            top_k        = settings.top_k,
+        )
+        if bm25._chunks:
+            retriever.index_chunks(bm25._chunks)
+
+        _tenant_chains[tenant_slug] = RAGChain(
+            llm            = _build_llm(),
+            vector_store   = vs,
+            retriever      = retriever,
+            reranker       = _reranker,
+            use_reranker   = True,
+            retrieve_top_k = settings.top_k,
+            rerank_top_k   = settings.reranker_top_k,
+            cite_sources   = True,
+        )
+
+    return _tenant_chains[tenant_slug]
+
 
 # ── HYBRID STORE ACCESSOR ─────────────────────────────────────────────────────
 
@@ -269,37 +304,37 @@ def is_online() -> bool:
 
 # ── FILE DELETION ─────────────────────────────────────────────────────────────
 
-def delete_file_from_cloud(filename: str) -> dict:
+def delete_file_from_cloud(filename: str, tenant_slug: str | None = None) -> dict:
     """
-    Delete a file's vectors from the CLOUD store only.
-
-    This is the correct deletion path when a cloud store is configured.
+    Delete a file's vectors from the tenant-scoped cloud store.
+    Falls back to the global cloud store when tenant_slug is None (dev/legacy mode).
 
     WHY cloud only:
       Cloud is the authoritative store. Local is a cache that syncs from cloud.
-      If you delete locally, the next sync re-pulls the file from cloud
-      (because to_pull = cloud_ids - local_ids will include those points again).
+      If you delete locally, the next sync re-pulls the file from cloud.
       The only way to permanently remove a file is to remove it from cloud first.
       Local cleanup then happens automatically on the next sync run.
 
     BM25 is cleaned up immediately because it is a local index and stale
     entries would cause dead results in offline queries right now, not later.
 
-    Local vectors are intentionally left as-is until the next sync.
-    During that window, offline mode may still return chunks from the deleted
-    file — this is an acceptable trade-off vs the risk of a diverged state.
-
     Preconditions (enforced by the router):
       - is_online() is True
       - get_cloud_store() is not None
       - filename exists in cloud_store.list_sources()
     """
-    # AFTER
+    # Resolve tenant-scoped stores if slug provided, else use global singletons
+    if tenant_slug:
+        target_cloud, target_bm25 = get_tenant_stores(tenant_slug)
+    else:
+        target_cloud = _cloud_store
+        target_bm25  = _bm25_store
+
     # Step 1: Delete from cloud (authoritative)
-    vectors_deleted = _cloud_store.delete_by_source(filename)
+    vectors_deleted = target_cloud.delete_by_source(filename)
     print(
         f"  [SERVICE] ✅ Deleted {vectors_deleted} vectors from cloud "
-        f"for '{filename}'"
+        f"for '{filename}' (tenant={tenant_slug or 'global'})"
     )
 
     # Step 2: Delete from Supabase Storage (if configured)
@@ -307,17 +342,17 @@ def delete_file_from_cloud(filename: str) -> dict:
     # Failure is logged but does not block the rest of the delete flow.
     try:
         from services.supabase_storage import delete_pdf_from_supabase
-        delete_pdf_from_supabase(filename)
+        delete_pdf_from_supabase(filename, tenant_slug=tenant_slug)
     except Exception as _exc:
         print(f"  [SERVICE] ⚠  Supabase delete skipped: {_exc}")
 
     # Step 3: Remove from BM25 immediately so queries stop returning stale results
-    bm25_deleted = _bm25_store.delete_by_source(filename)
+    bm25_deleted = target_bm25.delete_by_source(filename)
     print(f"  [SERVICE] Removed {bm25_deleted} BM25 entries for '{filename}'")
 
-    # Step 4: Update the live retriever's BM25 reference
+    # Step 4: Update the live retriever's BM25 reference (global chain only)
     with _lock:
-        if _chain and hasattr(_chain.retriever, "bm25"):
+        if _chain and hasattr(_chain.retriever, "bm25") and not tenant_slug:
             _chain.retriever.bm25 = _bm25_store
 
     return {
@@ -348,46 +383,83 @@ def delete_file_from_stores(filename: str) -> dict:
 
 # ── BM25 REBUILD ─────────────────────────────────────────────────────────────
 
-def rebuild_bm25_async() -> None:
+def rebuild_bm25_async(tenant_slug: str | None = None) -> None:
     """
     Rebuild BM25 from local store contents after a vector sync.
-    FIX: uses new_bm25.build() — index_chunks() is on HybridRetriever, not BM25Store.
-    FIXED: Preserves full payload (including 'page') to keep hash compatibility with Qdrant.
+
+    When tenant_slug is provided, rebuilds only the tenant-scoped BM25 store
+    and invalidates the tenant store cache so the next get_tenant_stores() call
+    picks up the fresh index.
+
+    When tenant_slug is None (legacy / global mode), rebuilds the global store.
     """
     def _rebuild():
         global _bm25_store
         try:
-            print("  [BM25] Starting async BM25 rebuild from local store...")
-            all_ids = _local_store.get_all_ids(with_payload_fields=["source"])
-            if not all_ids:
-                print("  [BM25] Local store empty — skipping BM25 rebuild")
-                return
+            if tenant_slug:
+                print(f"  [BM25] Rebuilding tenant BM25 — slug={tenant_slug}")
+                # Fetch from the tenant's vector store
+                t_vs, _ = get_tenant_stores(tenant_slug)
+                all_ids = t_vs.get_all_ids(with_payload_fields=["source"])
+                if not all_ids:
+                    print(f"  [BM25] Tenant store empty — skipping BM25 rebuild for {tenant_slug}")
+                    return
 
-            all_points = _local_store.get_points_by_ids([p["id"] for p in all_ids])
-            # 🔧 FIX: Copy the full payload instead of only content+source
-            chunks = [
-                {**pt["payload"]}  # includes "page", "source", "content", etc.
-                for pt in all_points
-                if pt["payload"].get("content")
-            ]
+                all_points = t_vs.get_points_by_ids([p["id"] for p in all_ids])
+                chunks = [
+                    {**pt["payload"]}
+                    for pt in all_points
+                    if pt["payload"].get("content")
+                ]
 
-            if not chunks:
-                print("  [BM25] No content found — skipping BM25 rebuild")
-                return
+                if not chunks:
+                    print(f"  [BM25] No content found — skipping BM25 rebuild for {tenant_slug}")
+                    return
 
-            data_dir = Path(settings.qdrant_path).parent
-            new_bm25 = BM25Store(path=str(data_dir / "bm25.pkl"))
-            new_bm25.build(chunks)
+                new_bm25 = BM25Store(tenant_slug=tenant_slug)
+                new_bm25.build(chunks)
 
-            with _lock:
-                _bm25_store = new_bm25
-                if _chain and hasattr(_chain.retriever, "bm25"):
-                    _chain.retriever.bm25 = new_bm25
+                # Evict cached stores so the next get_tenant_stores() call
+                # returns a fresh pair with the rebuilt BM25.
+                _tenant_stores_cloud.pop(tenant_slug, None)
+                _tenant_stores_local.pop(tenant_slug, None)
+                _tenant_chains.pop(tenant_slug, None)
 
-            print(f"  [BM25] ✅ Rebuilt BM25 index with {len(chunks)} chunks")
+                print(f"  [BM25] ✅ Tenant BM25 rebuilt — slug={tenant_slug}  chunks={len(chunks)}")
+
+            else:
+                # Legacy global rebuild path
+                print("  [BM25] Starting global async BM25 rebuild from local store...")
+                all_ids = _local_store.get_all_ids(with_payload_fields=["source"])
+                if not all_ids:
+                    print("  [BM25] Local store empty — skipping BM25 rebuild")
+                    return
+
+                all_points = _local_store.get_points_by_ids([p["id"] for p in all_ids])
+                # Copy the full payload (including 'page') to keep hash compatibility with Qdrant
+                chunks = [
+                    {**pt["payload"]}
+                    for pt in all_points
+                    if pt["payload"].get("content")
+                ]
+
+                if not chunks:
+                    print("  [BM25] No content found — skipping BM25 rebuild")
+                    return
+
+                data_dir = Path(settings.qdrant_path).parent
+                new_bm25 = BM25Store(path=str(data_dir / "bm25.pkl"))
+                new_bm25.build(chunks)
+
+                with _lock:
+                    _bm25_store = new_bm25
+                    if _chain and hasattr(_chain.retriever, "bm25"):
+                        _chain.retriever.bm25 = new_bm25
+
+                print(f"  [BM25] ✅ Global BM25 rebuilt with {len(chunks)} chunks")
 
         except Exception as e:
-            print(f"  [BM25] ⚠  BM25 rebuild failed: {e}")
+            print(f"  [BM25] ⚠  BM25 rebuild failed (tenant={tenant_slug}): {e}")
 
     threading.Thread(target=_rebuild, daemon=True).start()
 

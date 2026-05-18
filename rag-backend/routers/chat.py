@@ -48,7 +48,7 @@ from utils.logger import get_logger
 # Phase 1 — Multi-Tenancy: tenant resolver dependencies
 from fastapi import Depends
 from middleware.tenant_resolver import resolve_tenant, require_active_subscription
-from services.rag_service import get_tenant_stores
+from services.rag_service import get_tenant_stores, get_tenant_chain
 
 logger = get_logger(__name__)
 
@@ -224,10 +224,10 @@ async def chat_stream(request: Request, req: ChatRequest):
               No SSE needed — there is no LLM streaming in offline mode.
     """
     slug         = request.state.tenant_slug
-    vs, _bm25    = get_tenant_stores(slug)
+    vs, bm25     = get_tenant_stores(slug)
     vector_store = vs
     has_kb       = vector_store.count() > 0
-    chain        = rag_service.get_chain()
+    chain        = get_tenant_chain(slug)
     online       = rag_service.is_online()
 
     logger.info(
@@ -323,9 +323,7 @@ async def chat_stream(request: Request, req: ChatRequest):
 
                     # ── SEMANTIC SEARCH ONLY LOG ──────────────────
                     # Access raw retrieval before rerank from chain
-                    import services.rag_service as _rs
-                    chain2 = _rs.get_chain()
-                    q_vec = chain2.retriever.embedder.embed_text(req.question)
+                    q_vec = chain.retriever.embedder.embed_text(req.question)
                     logger.info(
                         "[CHAT/ONLINE/SEMANTIC] Query embedding first 10: %s",
                         q_vec[:10]
@@ -399,8 +397,8 @@ async def chat_offline(request: Request, req: ChatRequest):
     """
     # FIXED — resolve stores first, then check
     slug                = request.state.tenant_slug
-    active_store, _bm25 = get_tenant_stores(slug)
-    chain               = rag_service.get_chain()
+    active_store, bm25  = get_tenant_stores(slug)
+    chain               = get_tenant_chain(slug)
     has_kb              = active_store.count() > 0
 
     logger.info(
@@ -435,24 +433,27 @@ async def chat_offline(request: Request, req: ChatRequest):
 # ── Session management ────────────────────────────────────────
 
 @router.post("/session/clear")
-async def clear_session(req: ClearRequest):
-    logger.info("[CHAT] Session clear requested")
-    rag_service.clear_chain_memory()
-    logger.info("[CHAT] ✅ Conversation history cleared")
+async def clear_session(request: Request, req: ClearRequest):
+    slug  = request.state.tenant_slug
+    chain = get_tenant_chain(slug)
+    chain.reset_memory()
+    logger.info("[CHAT] ✅ Conversation history cleared — tenant=%s", slug)
     return {"status": "ok"}
 
 
 # ── Pin / unpin ───────────────────────────────────────────────
 
 @router.post("/session/pin")
-async def pin_source(req: PinRequest):
+async def pin_source(request: Request, req: PinRequest):
     """Pin the chain to a single source file."""
-    chain   = rag_service.get_chain()
-    sources = rag_service.get_vector_store().list_sources()
+    slug    = request.state.tenant_slug
+    chain   = get_tenant_chain(slug)
+    vs, _   = get_tenant_stores(slug)
+    sources = vs.list_sources()
 
     logger.info(
-        "[CHAT] Pin request — filename='%s'  available_sources=%d",
-        req.filename, len(sources),
+        "[CHAT] Pin request — tenant=%s  filename='%s'  available_sources=%d",
+        slug, req.filename, len(sources),
     )
 
     if req.filename not in sources:
@@ -467,22 +468,24 @@ async def pin_source(req: PinRequest):
         )
 
     chain.set_source_filter(req.filename)
-    logger.info("[CHAT] ✅ Pinned to source: '%s'", req.filename)
+    logger.info("[CHAT] ✅ Pinned to source: '%s'  tenant=%s", req.filename, slug)
     return {"status": "ok", "pinned": req.filename}
 
 
 @router.delete("/session/pin")
-async def unpin_source():
+async def unpin_source(request: Request):
     """Remove the source pin."""
-    logger.info("[CHAT] Unpin requested — removing source filter")
-    rag_service.get_chain().clear_source_filter()
-    logger.info("[CHAT] ✅ Source pin cleared")
+    slug = request.state.tenant_slug
+    logger.info("[CHAT] Unpin requested — tenant=%s  removing source filter", slug)
+    get_tenant_chain(slug).clear_source_filter()
+    logger.info("[CHAT] ✅ Source pin cleared — tenant=%s", slug)
     return {"status": "ok", "pinned": None}
 
 
 @router.get("/session/pin")
-async def get_pin():
+async def get_pin(request: Request):
     """Return the currently pinned filename, or null."""
-    pinned = rag_service.get_chain().get_source_filter()
-    logger.debug("[CHAT] Current pin: %s", pinned or "none")
+    slug   = request.state.tenant_slug
+    pinned = get_tenant_chain(slug).get_source_filter()
+    logger.debug("[CHAT] Current pin: %s  tenant=%s", pinned or "none", slug)
     return {"pinned": pinned}
